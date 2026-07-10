@@ -21,7 +21,7 @@ Skald is local push-to-talk speech-to-text for Windows. Tap a hotkey, talk, and 
 - Python 3.11+
 - A microphone
 
-A GPU is not required. On CPU, model size is the main speed lever; see the table below.
+A GPU is not required. On CPU, model size is the main speed lever; see the table below. If you do have a GPU, including an AMD one, see GPU acceleration below: Skald can ride a local whisper.cpp Vulkan server for large-model accuracy at real-time speed.
 
 ## Install
 
@@ -63,6 +63,18 @@ Set `MODEL_SIZE` in the CONFIG block at the top of `skald.py`. On CPU this is th
 | `medium.en` | slower | strong | when accuracy matters most |
 
 Other useful CONFIG dials: `HOTKEY`, `SILENCE_THRESHOLD`, `MAX_RECORD_SECONDS`, `SAVE_TRANSCRIPTS`, `TRANSCRIPT_RETENTION_DAYS`, `CHIME`, `LANGUAGE`.
+
+## GPU acceleration (optional, works on AMD)
+
+Skald's `ASR_BACKEND` is `auto`: on every launch it looks for a local whisper.cpp ASR server at `http://127.0.0.1:5075` and uses it when present, which moves transcription to your GPU through Vulkan. Vulkan means this works on AMD and Intel cards, not just NVIDIA. No server found, no problem: Skald quietly falls back to faster-whisper on CPU.
+
+To set it up:
+
+1. Download [koboldcpp](https://github.com/LostRuins/koboldcpp/releases) (`koboldcpp-nocuda.exe`, it embeds whisper.cpp with the Vulkan backend) into an `engines\` folder next to `skald.py`.
+2. Download a whisper GGML model, for example `ggml-large-v3-turbo-q5_0.bin`, into the same folder.
+3. That is all. Skald auto-starts the server when it launches and reuses it if it is already running. Point `ASR_SERVER_URL` at any other machine on your network if you keep the GPU elsewhere.
+
+With a mid-range GPU this runs the large-v3-turbo model faster than small models run on CPU, which is the best accuracy-per-second available anywhere in local dictation.
 
 ## Transcripts
 
