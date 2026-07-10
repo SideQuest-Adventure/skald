@@ -1321,6 +1321,8 @@ class _Overlay:
         # Waveform glow stack for the selected accent (falls back to gold).
         self.wave_stack = self.WAVE.get(CONFIG.get("THEME_ACCENT", "gold"),
                                         self.WAVE["gold"])
+        # Sprite-wave frame bank (Rath's soundwave art); None -> bar-meter fallback.
+        self._sprites = self._load_wave_sprites()
         self._phase = 0.0                # drives the idle shimmer on the waveform
         # Geometry: last session's size/position wins (overlay_state.json beside the
         # script); CONFIG provides the first-run defaults. Clamped on-screen + to min.
@@ -1711,10 +1713,85 @@ class _Overlay:
             return
         self._phase += 0.35
         try:
-            self._draw_waveform()
+            if self._sprites:
+                self._draw_wave_sprite()
+            else:
+                self._draw_waveform()
         except Exception:
             pass
         self.root.after(33, self._wave_loop)
+
+    def _load_wave_sprites(self):
+        """Load the pre-rendered sprite-wave frame bank (assets/wave). Returns None
+        when the bank is missing so the overlay falls back to the bar meter."""
+        import tkinter as tk
+        base = os.path.join(os.path.dirname(os.path.abspath(__file__)), "assets", "wave")
+        try:
+            star = [tk.PhotoImage(file=os.path.join(base, f"star_{i}.png"))
+                    for i in range(3)]
+            stream = {(li, p): tk.PhotoImage(
+                          file=os.path.join(base, f"stream_L{li}_P{p}.png"))
+                      for li in range(5) for p in range(8)}
+            return {"star": star, "stream": stream,
+                    "star_w": star[1].width(), "stream_w": stream[(0, 0)].width()}
+        except Exception:
+            return None
+
+    # Elder Futhark glyphs the drift layer writes with (plain text items, gold ink).
+    RUNES = "ᚠᚢᚦᚨᚱᚲᚷᚹᚾᛁᛃᛈᛊᛏᛒᛖᛗᛚᛜᛞᛟ"
+
+    def _draw_wave_sprite(self):
+        """Rath's soundwave art, alive: the starburst breathes at the left, the stream
+        scrolls RIGHTWARD and swells with the voice (5 amplitude levels x 8 phases from
+        the shipped frame bank), and gold runes spawn off the star and drift down the
+        current when you speak. All work stays on the tk thread; the audio callback
+        only feeds the RMS deque."""
+        import random
+        c = self.canvas
+        vals = list(self.sess.rms_history)
+        raw = min(max((max(vals[-6:]) if vals else 0.0) / 0.08, 0.0), 1.0)
+        if not self.sess.recording:
+            raw = 0.0
+        # Smooth so the wave swells and settles instead of twitching.
+        self._level = 0.82 * getattr(self, "_level", 0.0) + 0.18 * raw
+        lv = self._level
+        w = c.winfo_width() or (CONFIG["OVERLAY_WIDTH"] - 24)
+        ch = c.winfo_height() or 40
+        mid = ch // 2
+        sp = self._sprites
+        c.delete("all")
+        # Stream tiles scroll rightward; speaking speeds the current up.
+        self._sprite_phase = (getattr(self, "_sprite_phase", 0.0)
+                              + 0.55 + 2.6 * lv) % 8.0
+        li = min(4, int(round(lv * 4)))
+        frame = sp["stream"][(li, int(self._sprite_phase))]
+        x = sp["star_w"] - 12
+        while x < w:
+            c.create_image(x, mid, anchor="w", image=frame)
+            x += sp["stream_w"]
+        # The voice-source starburst pulses with level, drawn over the stream head.
+        star = sp["star"][0 if lv < 0.12 else (1 if lv < 0.55 else 2)]
+        c.create_image(0, mid, anchor="w", image=star)
+        # Rune drift: new glyphs leave the star while you speak and ride the current.
+        runes = getattr(self, "_runes", None)
+        if runes is None:
+            runes = self._runes = []
+        if self.sess.recording and len(runes) < 9 and random.random() < 0.05 + 0.35 * lv:
+            spread = max(mid - 6, 1)
+            runes.append({"x": float(sp["star_w"] + 4),
+                          "y": mid + random.randint(-spread, spread),
+                          "g": random.choice(self.RUNES), "age": 0})
+        keep = []
+        for r in runes:
+            r["x"] += 1.6 + 3.4 * lv
+            r["age"] += 1
+            if r["x"] < w and r["age"] < 90:
+                col = self.GOLD_HI if r["age"] < 24 else (
+                      self.GOLD if r["age"] < 60 else "#8A6A1F")
+                c.create_text(r["x"], r["y"], text=r["g"], fill=col,
+                              font=("Palatino Linotype", 10, "bold"), anchor="w")
+                keep.append(r)
+        self._runes = keep
 
     def _draw_waveform(self):
         """A center-mirrored row of slim bars whose heights follow recent RMS. Idle is a

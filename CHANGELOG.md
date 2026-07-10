@@ -1,5 +1,17 @@
 # Changelog
 
+## 1.2.0
+
+The wave is now the owner's own soundwave art, brought to life.
+
+- The overlay level meter is a sprite wave: a starburst voice-source that breathes with
+  your volume, and a blue rune-stream that scrolls rightward, swelling from a calm line
+  in silence to the full braided current when you speak (5 amplitude levels x 8 scroll
+  phases, pre-rendered frame bank in assets/wave, regenerable via tools/gen_wave_frames.py).
+- Gold Elder Futhark runes spawn off the starburst while you talk and ride the current,
+  aging from bright gold to ember before they fade.
+- If the frame bank is missing the overlay quietly falls back to the bar meter.
+
 ## 1.1.1
 
 Overlay polish from first field use.
