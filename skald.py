@@ -173,7 +173,7 @@ CONFIG = {
     "OVERLAY_HEIGHT": 150,
     # Overlay waveform accent. Toggle "ice" (cool blue voice-energy, the default) or
     # "amber" (molten). Runic text, dividers, and the close control stay gold either way.
-    "THEME_ACCENT": "ice",
+    "THEME_ACCENT": "gold",
 
     # ---- Never-lose-a-brainstorm capture (2026-07-07, Rath's call) ----
     # Every transcribed phrase is appended to a dated file THE MOMENT it's heard, so a
@@ -1053,9 +1053,7 @@ def _load_whisper(size):
     return m
 
 
-# Divider drawn between committed phrases in the overlay transcript: a thin rule with
-# the Norse "gift/junction" rune centered. Rendered gold via the Text "divider" tag.
-PHRASE_DIVIDER = "──────  ᛭  ──────"
+# (Phrase dividers were removed by owner feedback: the transcript flows as one passage.)
 
 
 class LiveSession:
@@ -1242,9 +1240,8 @@ class LiveSession:
         if text:
             transcript.append(text)
             self._capture(text)          # persist THIS phrase now (crash/misclick-proof)
-            # Display joins phrases with the rune divider for the overlay; the paste path
-            # (_finalize) still joins with plain spaces, so the pasted text is unaffected.
-            display = ("\n" + PHRASE_DIVIDER + "\n").join(transcript)
+            # Display flows phrases together as one passage, exactly like the paste.
+            display = " ".join(transcript)
             self.ui_q.put(("partial", display))
 
     def _finalize(self, full_chunks, transcript):
@@ -1289,14 +1286,16 @@ class _Overlay:
     """
 
     BG, FG, SUB, DIM = "#23252B", "#EDE5D3", "#9A96A2", "#34343C"
-    BORDER = "#8A6A2F"                       # thin muted-gold window border line
-    GOLD, GOLD_HI = "#E2A84E", "#F5C879"     # runes, dividers, close control (always gold)
+    BORDER = "#9A7D33"                       # thin gold window border line
+    GOLD, GOLD_HI = "#E8C766", "#FFE28A"     # runes and chrome: true gold, not orange
     ACC, WARN = GOLD, GOLD_HI                # status/timer accent + near-cap highlight
     # Waveform glow stacks (dim -> mid -> bright core), drawn as three layered widths to
-    # fake a glow since tkinter has no alpha. "ice" = blue voice-energy (icon default).
-    WAVE = {"ice":   ("#1E4A66", "#3E7FA8", "#8FD4F5"),
+    # fake a glow since tkinter has no alpha. "gold" = molten gold (the default);
+    # "ice" = blue voice-energy; "amber" = the older warm stack.
+    WAVE = {"gold":  ("#8A6A1F", "#D4AF37", "#FFE082"),
+            "ice":   ("#1E4A66", "#3E7FA8", "#8FD4F5"),
             "amber": ("#6B4E1F", "#B07E2E", "#F5C879")}
-    SB_TRACK, SB_THUMB, SB_W = "#2E2A22", "#E2A84E", 14   # scrollbar: track, gold thumb, width
+    SB_TRACK, SB_THUMB, SB_W = "#2E2A22", "#E8C766", 14   # scrollbar: track, gold thumb, width
 
     MIN_W, MIN_H = 280, 140
 
@@ -1319,9 +1318,9 @@ class _Overlay:
             root.attributes("-alpha", c["OVERLAY_OPACITY"])
         except Exception:
             pass
-        # Waveform glow stack for the selected accent (falls back to blue).
-        self.wave_stack = self.WAVE.get(CONFIG.get("THEME_ACCENT", "ice"),
-                                        self.WAVE["ice"])
+        # Waveform glow stack for the selected accent (falls back to gold).
+        self.wave_stack = self.WAVE.get(CONFIG.get("THEME_ACCENT", "gold"),
+                                        self.WAVE["gold"])
         self._phase = 0.0                # drives the idle shimmer on the waveform
         # Geometry: last session's size/position wins (overlay_state.json beside the
         # script); CONFIG provides the first-run defaults. Clamped on-screen + to min.
@@ -1389,14 +1388,14 @@ class _Overlay:
         self.sb = tk.Canvas(txt_wrap, width=self.SB_W, bg=self.SB_TRACK,
                             highlightthickness=0, bd=0, cursor="hand2")
         self.sb.pack(side="right", fill="y")
+        # Manuscript-flavored body face: Palatino ships with Windows and reads like a
+        # printed saga; tkinter silently falls back to the default family if missing.
         self.text = tk.Text(txt_wrap, bg=self.BG, fg=self.FG, wrap="word",
-                            font=("Segoe UI", 10), relief="flat", bd=0,
-                            highlightthickness=0, padx=0, pady=0, cursor="arrow",
-                            insertwidth=0, spacing3=3, yscrollcommand=self._sb_set)
+                            font=("Palatino Linotype", 12), relief="flat", bd=0,
+                            highlightthickness=0, padx=2, pady=2, cursor="arrow",
+                            insertwidth=0, spacing2=2, spacing3=4,
+                            yscrollcommand=self._sb_set)
         self.text.pack(side="left", fill="both", expand=True)
-        # Gold, centered styling for the "᛭" phrase dividers between committed phrases.
-        self.text.tag_configure("divider", foreground=self.GOLD, justify="center",
-                                spacing1=4, spacing3=4)
         self.text.insert("1.0", subtitle)
         self.text.config(state="disabled")
         self.text.bind("<MouseWheel>", self._wheel)
@@ -1551,26 +1550,9 @@ class _Overlay:
             self.text.delete("1.0", "end")
             if t:
                 self.text.insert("1.0", t)
-                self._tag_dividers()
             self.text.config(state="disabled")
             if at_bottom:
                 self.text.see("end")
-        except Exception:
-            pass
-
-    def _tag_dividers(self):
-        """Paint every phrase-divider line gold and centered. The dividers arrive as
-        plain lines equal to PHRASE_DIVIDER in the joined transcript; tag each so the
-        rune rule reads as gold written-word between the phrases."""
-        try:
-            idx = "1.0"
-            while True:
-                hit = self.text.search(PHRASE_DIVIDER, idx, stopindex="end")
-                if not hit:
-                    break
-                end = f"{hit}+{len(PHRASE_DIVIDER)}c"
-                self.text.tag_add("divider", hit, end)
-                idx = end
         except Exception:
             pass
 
@@ -1748,7 +1730,9 @@ class _Overlay:
             w = CONFIG["OVERLAY_WIDTH"] - 24
         ch = c.winfo_height() or 40
         mid = ch / 2.0
-        vals = list(self.sess.rms_history)          # snapshot; audio thread only appends
+        # Newest sample renders at the LEFT and history flows rightward, so speech
+        # visibly builds to the right like a line of runes being written.
+        vals = list(self.sess.rms_history)[::-1]    # snapshot; audio thread only appends
         n = len(vals) or 1
         gap = 2
         bw = max(2.0, (w - (n - 1) * gap) / n)
@@ -1758,7 +1742,7 @@ class _Overlay:
         for i, v in enumerate(vals):
             # Idle shimmer: a low travelling ripple so silence still breathes; speech
             # overrides it as the real RMS climbs well past the shimmer floor.
-            shimmer = 0.06 + 0.04 * (0.5 + 0.5 * math.sin(self._phase + i * 0.5))
+            shimmer = 0.06 + 0.04 * (0.5 + 0.5 * math.sin(self._phase - i * 0.5))
             level = min(max(v / 0.08, 0.0), 1.0)
             amp = max(shimmer, level) if recording else shimmer * 0.6
             half = amp * (mid - 2)

@@ -1,5 +1,16 @@
 # Changelog
 
+## 1.1.1
+
+Overlay polish from first field use.
+
+- The waveform now builds to the RIGHT: new sound enters at the left and history flows
+  rightward, like a line being written.
+- Molten-gold waveform is the new default (THEME_ACCENT "gold"); ice blue and amber
+  remain one CONFIG word away. Chrome gold is now a true gold rather than orange.
+- The transcript flows as one continuous passage; the per-phrase rune dividers are gone.
+- Transcript face is now Palatino at 12pt for a printed-saga feel.
+
 ## 1.1.0
 
 - `--doctor` now reports the ASR engine that will actually carry your voice: whether a
