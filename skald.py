@@ -497,6 +497,36 @@ def cmd_doctor():
     except Exception as exc:
         check("clipboard round-trip (pyperclip)", False, str(exc)[:60])
 
+    # 6. ASR engine report: which backend will actually carry your voice.
+    #    The GPU server is optional, so these lines are INFO, not pass/fail,
+    #    except when CONFIG demands a server that cannot be reached.
+    backend = CONFIG.get("ASR_BACKEND", "auto")
+    server_url = CONFIG.get("ASR_SERVER_URL", "")
+    exe = CONFIG.get("ASR_SERVER_EXE", "")
+    mdl = CONFIG.get("ASR_SERVER_MODEL", "")
+    server_live = False
+    try:
+        import urllib.request as _ur
+        _ur.urlopen(server_url + "/api/v1/info/version", timeout=2)
+        server_live = True
+    except Exception:
+        server_live = False
+    if server_live:
+        check("GPU ASR server reachable", True, server_url + " (whisper.cpp Vulkan)")
+        print("[INFO] engine in use: GPU server, large-model accuracy at GPU speed")
+    elif os.path.isfile(exe) and os.path.isfile(mdl):
+        check("GPU ASR server auto-start available", True,
+              os.path.basename(exe) + " + " + os.path.basename(mdl))
+        print("[INFO] engine in use: GPU server (Skald will start it on launch)")
+    elif backend == "server":
+        check("GPU ASR server reachable", False,
+              "ASR_BACKEND is 'server' but nothing answers at " + server_url)
+    else:
+        model_size = CONFIG.get("MODEL_SIZE", "base.en")
+        print(f"[INFO] engine in use: faster-whisper on CPU (model {model_size})")
+        print("[INFO] optional GPU boost, AMD included: see the README section")
+        print("       'GPU acceleration' to add a local whisper.cpp Vulkan server")
+
     print("-" * 44)
     ok = all(results)
     print("All checks passed." if ok else "Some checks FAILED (see above).")
