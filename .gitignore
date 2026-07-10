@@ -4,3 +4,5 @@ __pycache__/
 venv/
 *.log
 HANDOFF.md
+assets/Skald-source.png
+assets/Skald-Pixel-source.png
