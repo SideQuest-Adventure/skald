@@ -1,5 +1,10 @@
 # Changelog
 
+## 1.2.2
+
+- More power: full voice now gusts up to two runes per tick, holds up to 20 in flight,
+  and loud runes render larger. Quiet speech stays sparse, as it should.
+
 ## 1.2.1
 
 - The wave grows with the window: the canvas takes about a fifth of the window height

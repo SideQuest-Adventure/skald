@@ -1801,11 +1801,19 @@ class _Overlay:
         runes = getattr(self, "_runes", None)
         if runes is None:
             runes = self._runes = []
-        if self.sess.recording and len(runes) < 9 and random.random() < 0.05 + 0.35 * lv:
+        # Louder voice = more runes, bigger runes. Full voice can gust two per tick.
+        cap = 6 + int(lv * 14)
+        spawns = (1 if random.random() < 0.06 + 0.55 * lv else 0) + \
+                 (1 if lv > 0.7 and random.random() < 0.35 else 0)
+        if self.sess.recording:
             spread = max(mid - 6, 1)
-            runes.append({"x": float(sp["star_w"] * sy + 4),
-                          "y": mid + random.randint(-spread, spread),
-                          "g": random.choice(self.RUNES), "age": 0})
+            for _ in range(spawns):
+                if len(runes) >= cap:
+                    break
+                runes.append({"x": float(sp["star_w"] * sy + 4),
+                              "y": mid + random.randint(-spread, spread),
+                              "g": random.choice(self.RUNES), "age": 0,
+                              "size": 10 + int(lv * 5)})
         keep = []
         for r in runes:
             r["x"] += 1.6 + 3.4 * lv
@@ -1814,7 +1822,8 @@ class _Overlay:
                 col = self.GOLD_HI if r["age"] < 24 else (
                       self.GOLD if r["age"] < 60 else "#8A6A1F")
                 c.create_text(r["x"], r["y"], text=r["g"], fill=col,
-                              font=("Palatino Linotype", 10, "bold"), anchor="w")
+                              font=("Palatino Linotype", r.get("size", 10), "bold"),
+                              anchor="w")
                 keep.append(r)
         self._runes = keep
 
