@@ -1,4 +1,4 @@
-<p align="center"><img src="assets/skald-hero.jpg" alt="A Norse drinking horn on carved stone, with a stream of blue voice-light turning into golden runes" width="420" height="420"></p>
+<p align="center"><img src="assets/skald-hero.png" alt="Pixel art of a Norse drinking horn on carved stone, with a stream of blue voice-light turning into golden runes" width="420" height="420"></p>
 
 # Skald
 
