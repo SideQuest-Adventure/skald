@@ -1526,10 +1526,16 @@ class _Overlay:
         self.root.geometry(f"{w}x{h}")
 
     def _on_configure(self, e=None):
-        # The Text widget word-wraps to its own width automatically, so a resize needs
-        # no manual reflow (the old Label needed a wraplength update here). Kept as a
-        # hook in case future chrome needs to react to resize.
-        return
+        # The Text widget word-wraps to its own width automatically. The wave canvas,
+        # though, grows with the window: ~22% of window height, floor 40, cap 160, so
+        # a taller window means a thicker, more detailed current.
+        try:
+            wave_h = max(40, min(160, int(self.root.winfo_height() * 0.22)))
+            if wave_h != getattr(self, "_wave_h", 40):
+                self._wave_h = wave_h
+                self.canvas.configure(height=wave_h)
+        except Exception:
+            pass
 
     def _wheel(self, e):
         """Mouse-wheel scroll the transcript even though the overlay never holds focus."""
@@ -1760,17 +1766,36 @@ class _Overlay:
         mid = ch // 2
         sp = self._sprites
         c.delete("all")
+        # Vertical stretch: taller canvas -> integer vertical zoom of the frames, so
+        # the ribbons genuinely thicken as the window grows. Zoomed frames are cached.
+        sy = max(1, round(ch / 40))
+        zc = getattr(self, "_zoom_cache", None)
+        if zc is None:
+            zc = self._zoom_cache = {}
         # Stream tiles scroll rightward; speaking speeds the current up.
         self._sprite_phase = (getattr(self, "_sprite_phase", 0.0)
                               + 0.55 + 2.6 * lv) % 8.0
         li = min(4, int(round(lv * 4)))
-        frame = sp["stream"][(li, int(self._sprite_phase))]
-        x = sp["star_w"] - 12
+        key = ("s", li, int(self._sprite_phase), sy)
+        frame = zc.get(key)
+        if frame is None:
+            frame = sp["stream"][(li, int(self._sprite_phase))]
+            if sy > 1:
+                frame = frame.zoom(1, sy)
+            zc[key] = frame
+        x = sp["star_w"] * sy - 12
         while x < w:
             c.create_image(x, mid, anchor="w", image=frame)
             x += sp["stream_w"]
         # The voice-source starburst pulses with level, drawn over the stream head.
-        star = sp["star"][0 if lv < 0.12 else (1 if lv < 0.55 else 2)]
+        si = 0 if lv < 0.12 else (1 if lv < 0.55 else 2)
+        skey = ("star", si, sy)
+        star = zc.get(skey)
+        if star is None:
+            star = sp["star"][si]
+            if sy > 1:
+                star = star.zoom(sy, sy)
+            zc[skey] = star
         c.create_image(0, mid, anchor="w", image=star)
         # Rune drift: new glyphs leave the star while you speak and ride the current.
         runes = getattr(self, "_runes", None)
@@ -1778,7 +1803,7 @@ class _Overlay:
             runes = self._runes = []
         if self.sess.recording and len(runes) < 9 and random.random() < 0.05 + 0.35 * lv:
             spread = max(mid - 6, 1)
-            runes.append({"x": float(sp["star_w"] + 4),
+            runes.append({"x": float(sp["star_w"] * sy + 4),
                           "y": mid + random.randint(-spread, spread),
                           "g": random.choice(self.RUNES), "age": 0})
         keep = []

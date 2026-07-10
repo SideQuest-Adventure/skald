@@ -1,5 +1,12 @@
 # Changelog
 
+## 1.2.1
+
+- The wave grows with the window: the canvas takes about a fifth of the window height
+  (40 to 160 px), and the art thickens through cached integer zoom, so stretching the
+  overlay taller shows a bigger, more detailed current. The starburst and rune lane
+  scale with it.
+
 ## 1.2.0
 
 The wave is now the owner's own soundwave art, brought to life.
