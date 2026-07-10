@@ -1017,28 +1017,47 @@ def main(device_spec=None):
 # ---------------------------------------------------------------------------
 # Live (streaming) mode - tap-to-toggle + floating overlay + as-you-go text
 # ---------------------------------------------------------------------------
+def _horn(kind, sr=44100):
+    """Synthesize a short Viking war-horn blast. A horn is a fundamental plus decaying
+    harmonics, a slow breathy attack, and slight vibrato; start = a rising call (the
+    horn summons your voice), stop = a shorter falling blast an octave-ish down. The
+    two cues are deliberately UNMISTAKABLE from each other so the mic state is never
+    in doubt."""
+    if kind == "start":
+        dur, f0, f1 = 0.60, 146.8, 196.0     # D3 rising to G3: the summons
+    else:
+        dur, f0, f1 = 0.38, 130.8, 98.0      # C3 falling to G2: the release
+    n = int(sr * dur)
+    t = np.linspace(0, dur, n, endpoint=False)
+    # Pitch glides between the two notes; vibrato gives it lungs.
+    glide = f0 + (f1 - f0) * (t / dur) ** 1.4
+    vib = 1.0 + 0.006 * np.sin(2 * np.pi * 5.2 * t)
+    phase = 2 * np.pi * np.cumsum(glide * vib) / sr
+    wave = np.zeros(n, dtype=np.float64)
+    for h, g in ((1, 1.00), (2, 0.55), (3, 0.34), (4, 0.18), (5, 0.10), (6, 0.05)):
+        wave += g * np.sin(phase * h)
+    # Breathy attack and a natural tail instead of an electronic gate.
+    atk = int(sr * (0.12 if kind == "start" else 0.05))
+    env = np.ones(n)
+    env[:atk] = np.linspace(0, 1, atk) ** 1.6
+    rel = int(sr * 0.10)
+    env[-rel:] *= np.linspace(1, 0, rel) ** 0.8
+    wave *= env
+    wave /= max(1e-9, np.abs(wave).max())
+    return wave.astype(np.float32)
+
+
 def _chime(kind="stop"):
-    """Two-note cue on record toggle: rising = started listening, falling = stopped.
-    Plays a synthesized tone through sounddevice's DEFAULT OUTPUT device - the same
-    device the rest of your audio uses (your headset) - because winsound.Beep routed to
-    the legacy system beep and was inaudible on this setup. Daemon thread + fully guarded
-    so it never delays or breaks the record toggle. No-op unless CHIME."""
+    """War-horn cue on record toggle: a rising horn call = the mic is OPEN, a short
+    falling blast = it is CLOSED. Plays through sounddevice's DEFAULT OUTPUT device
+    (your headset), on a daemon thread, fully guarded so it never delays or breaks
+    the record toggle. No-op unless CHIME."""
     if not CONFIG.get("CHIME"):
         return
     def _play():
         try:
-            sr = 44100
             amp = float(CONFIG.get("CHIME_VOLUME", 0.3))
-            freqs = (660, 990) if kind == "start" else (880, 587)
-            seg = []
-            for f in freqs:
-                t = np.linspace(0, 0.09, int(sr * 0.09), endpoint=False)
-                tone = (amp * np.sin(2 * np.pi * f * t)).astype(np.float32)
-                fade = int(sr * 0.01)                       # 10ms fades kill clicks
-                tone[:fade] *= np.linspace(0, 1, fade, dtype=np.float32)
-                tone[-fade:] *= np.linspace(1, 0, fade, dtype=np.float32)
-                seg.append(tone)
-            sd.play(np.concatenate(seg), sr)                # default output = your headset
+            sd.play(amp * _horn(kind), 44100)   # default output = your headset
         except Exception:
             pass
     threading.Thread(target=_play, daemon=True).start()

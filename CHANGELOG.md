@@ -1,5 +1,11 @@
 # Changelog
 
+## 1.2.3
+
+- The chimes are now a synthesized Viking war horn: a rising horn call means the mic is
+  OPEN and listening, a shorter falling blast means it is CLOSED. The two cues differ in
+  length, direction, and register so the state is never in doubt.
+
 ## 1.2.2
 
 - More power: full voice now gusts up to two runes per tick, holds up to 20 in flight,
