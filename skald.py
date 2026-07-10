@@ -43,9 +43,11 @@ CONFIG = {
     # Verdict: medium.en is unusable for push-to-talk here. small.en is the
     # accuracy-proven sweet spot (the pre-6/28 daily driver); base.en is the
     # fast lane if small ever feels slow. English-only ".en" models are faster
-    # AND more accurate for English. NOTE: no CUDA on this AMD box - the ladder
-    # runs on CPU. Override per run with  --model <name>.
-    "MODEL_SIZE": "small.en",
+    # AND more accurate for English. "auto" (default since 1.3.0) reads YOUR CPU
+    # and picks the rung for it: 8+ cores -> small.en, 4-7 -> base.en, else
+    # tiny.en - so a weak laptop stays snappy without knowing what a Whisper
+    # model is. Override per run with  --model <name>.
+    "MODEL_SIZE": "auto",
 
     # Pynput key to hold for recording. Examples:
     #   keyboard.Key.ctrl_r   - Right Ctrl (default)
@@ -150,8 +152,10 @@ CONFIG = {
     # Tap the hotkey to start, watch a floating overlay show it hearing you + the
     # words as you pause, tap again to stop and paste. Opt-in; classic hold-to-talk
     # is unchanged and stays the default.
-    # Model that drives the SNAPPY live text (small.en = fast, ~0.5s behind a pause).
-    "LIVE_MODEL": "small.en",
+    # Model that drives the SNAPPY live text. "auto" (default since 1.3.0) picks by
+    # CPU cores, same ladder as MODEL_SIZE - live streaming on a 2-core laptop with
+    # small.en would lag hopelessly behind your voice.
+    "LIVE_MODEL": "auto",
     # Model for the final paste when you tap off. None = paste the streamed live text
     # THE INSTANT you tap off (Rath's 2026-07-02 call - closer-to-instant typing; the
     # live text is what you watched appear anyway). Set "small.en" to add a fast
@@ -193,7 +197,7 @@ CONFIG = {
     # headset) via sounddevice - winsound.Beep routed to the legacy system beep and was
     # inaudible here. Default ON (Rath wants it); --no-chime for one silent run.
     "CHIME": True,
-    "CHIME_VOLUME": 0.3,                     # 0.0–1.0 tone amplitude
+    "CHIME_VOLUME": 0.22,                    # 0.0–1.0 tone amplitude (0.3 was a blast)
 
     # ---- Command routing ----
     # When True, a transcript that STARTS WITH the prefix is parsed as a command
@@ -428,6 +432,122 @@ def cmd_list():
           "or run with  --device <index|name>")
 
 
+# ---------------------------------------------------------------------------
+# Hardware auto-detect - "what machine is this, and which engine fits it best?"
+# Not everyone knows what's in their box (a gifted PC, a two-year-old budget
+# build). Skald reads the GPU + CPU itself and says, in plain words, which
+# engine it will use and whether a faster one is one download away.
+# ---------------------------------------------------------------------------
+def _gpu_names():
+    """Best-effort GPU name list, no extra deps. Failure of any probe -> []."""
+    try:
+        if sys.platform == "win32":
+            out = subprocess.run(
+                ["powershell", "-NoProfile", "-Command",
+                 "(Get-CimInstance Win32_VideoController).Name"],
+                capture_output=True, text=True, timeout=12,
+                creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0))
+            return [ln.strip() for ln in out.stdout.splitlines() if ln.strip()]
+        if sys.platform == "darwin":
+            out = subprocess.run(["system_profiler", "SPDisplaysDataType"],
+                                 capture_output=True, text=True, timeout=12)
+            return [ln.split(":", 1)[1].strip() for ln in out.stdout.splitlines()
+                    if "Chipset Model" in ln]
+        out = subprocess.run(["sh", "-c", "lspci | grep -iE 'vga|3d controller'"],
+                             capture_output=True, text=True, timeout=12)
+        return [ln.split(":", 2)[-1].strip() for ln in out.stdout.splitlines() if ln.strip()]
+    except Exception:
+        return []
+
+
+def classify_gpu(name):
+    """One GPU name -> 'nvidia' | 'amd' | 'intel-arc' | 'apple' | 'igpu' | 'unknown'.
+    iGPU markers are checked BEFORE the generic vendor words so an 'AMD Radeon(TM)
+    Graphics' APU or 'Intel(R) Iris Xe' never masquerades as a discrete card."""
+    low = name.lower()
+    igpu = ("radeon(tm) graphics", "vega 8", "vega 7", "vega 6", "vega 3",
+            "uhd graphics", "iris xe", "iris(r)", "hd graphics",
+            "microsoft basic", "virtual", "parsec", "displaylink")
+    if any(k in low for k in igpu):
+        return "igpu"
+    if any(k in low for k in ("geforce", "rtx", "gtx", "quadro", "nvidia")):
+        return "nvidia"
+    if "apple m" in low:
+        return "apple"
+    if any(k in low for k in ("arc a", "arc b", "intel arc")):
+        return "intel-arc"
+    if any(k in low for k in ("radeon", "amd", "firepro")):
+        return "amd"
+    if "intel" in low:
+        return "igpu"
+    return "unknown"
+
+
+_GPU_RANK = {"nvidia": 0, "amd": 1, "intel-arc": 2, "apple": 3, "igpu": 4,
+             "unknown": 5, "none": 9}
+
+
+def detect_hardware():
+    """{'gpus': [(name, class)], 'best_gpu': name, 'gpu_class': class, 'cpu_cores': n}"""
+    gpus = [(n, classify_gpu(n)) for n in _gpu_names()]
+    best = min(gpus, key=lambda g: _GPU_RANK[g[1]]) if gpus else ("", "none")
+    return {"gpus": gpus, "best_gpu": best[0], "gpu_class": best[1],
+            "cpu_cores": os.cpu_count() or 4}
+
+
+def pick_cpu_model(cores):
+    """CPU-ladder pick when no GPU server carries the load. Bench-anchored
+    (2026-07-02): small.en is the accuracy sweet spot but needs a real CPU;
+    weaker boxes get base.en/tiny.en so push-to-talk stays snappy."""
+    if cores >= 8:
+        return "small.en"
+    if cores >= 4:
+        return "base.en"
+    return "tiny.en"
+
+
+def recommend_engine(hw, server_ready):
+    """(verdict, plain-English reason). verdict: 'gpu-server' (use/start it),
+    'gpu-available' (hardware could, assets missing - tell them the one download),
+    'cpu' (this box's honest best is the CPU ladder)."""
+    vulkan_capable = hw["gpu_class"] in ("nvidia", "amd", "intel-arc")
+    if vulkan_capable and server_ready:
+        return ("gpu-server",
+                f"{hw['best_gpu']}: big-model accuracy at GPU speed (whisper.cpp Vulkan)")
+    if vulkan_capable:
+        return ("gpu-available",
+                f"{hw['best_gpu']} can run Whisper 30-70x realtime with the free "
+                f"Vulkan server - one download, works on NVIDIA, AMD and Intel Arc "
+                f"alike (README > 'GPU acceleration')")
+    return ("cpu",
+            f"no discrete GPU found - CPU engine, model {pick_cpu_model(hw['cpu_cores'])} "
+            f"({hw['cpu_cores']} cores)")
+
+
+def resolve_auto_models(hw=None):
+    """MODEL_SIZE / LIVE_MODEL set to 'auto' resolve to the CPU-ladder pick for this
+    machine. Called once at startup and by --doctor; explicit names pass through."""
+    if "auto" in (CONFIG.get("MODEL_SIZE"), CONFIG.get("LIVE_MODEL")):
+        hw = hw or detect_hardware()
+        pick = pick_cpu_model(hw["cpu_cores"])
+        if CONFIG.get("MODEL_SIZE") == "auto":
+            CONFIG["MODEL_SIZE"] = pick
+        if CONFIG.get("LIVE_MODEL") == "auto":
+            CONFIG["LIVE_MODEL"] = pick
+        print(f"🧭 Auto model: {pick} ({hw['cpu_cores']} CPU cores)")
+
+
+def _print_gpu_hint():
+    """Called right before the CPU engine loads: resolve any 'auto' model picks for
+    THIS machine, and if the box actually has a Vulkan-capable GPU, say (once, in
+    plain words) that a much faster engine is one download away."""
+    hw = detect_hardware()
+    resolve_auto_models(hw)
+    verdict, reason = recommend_engine(hw, server_ready=False)
+    if verdict == "gpu-available":
+        print(f"💡 {reason}")
+
+
 def cmd_doctor():
     """Self-diagnostic: print PASS/FAIL for the runtime, dependencies, a default
     mic, the Whisper model cache dir, and a clipboard round-trip. Exits 0 only if
@@ -497,7 +617,25 @@ def cmd_doctor():
     except Exception as exc:
         check("clipboard round-trip (pyperclip)", False, str(exc)[:60])
 
-    # 6. ASR engine report: which backend will actually carry your voice.
+    # 6. Hardware report: what this machine actually is, in plain words. You
+    #    shouldn't need to know whether your GPU wants CUDA or Vulkan - Skald reads
+    #    the box and says which engine fits it.
+    hw = detect_hardware()
+    if hw["gpus"]:
+        for name, cls in hw["gpus"]:
+            label = {"nvidia": "discrete NVIDIA - Vulkan server capable",
+                     "amd": "discrete AMD - Vulkan server capable",
+                     "intel-arc": "discrete Intel Arc - Vulkan server capable",
+                     "apple": "Apple silicon",
+                     "igpu": "integrated graphics (CPU-class for Whisper)",
+                     "unknown": "unrecognized"}[cls]
+            print(f"[INFO] GPU: {name}  ({label})")
+    else:
+        print("[INFO] GPU: none detected")
+    print(f"[INFO] CPU: {hw['cpu_cores']} cores"
+          f"  (CPU-ladder model pick: {pick_cpu_model(hw['cpu_cores'])})")
+
+    # 7. ASR engine report: which backend will actually carry your voice.
     #    The GPU server is optional, so these lines are INFO, not pass/fail,
     #    except when CONFIG demands a server that cannot be reached.
     backend = CONFIG.get("ASR_BACKEND", "auto")
@@ -522,10 +660,14 @@ def cmd_doctor():
         check("GPU ASR server reachable", False,
               "ASR_BACKEND is 'server' but nothing answers at " + server_url)
     else:
+        resolve_auto_models(hw)
+        verdict, reason = recommend_engine(hw, server_ready=False)
         model_size = CONFIG.get("MODEL_SIZE", "base.en")
         print(f"[INFO] engine in use: faster-whisper on CPU (model {model_size})")
-        print("[INFO] optional GPU boost, AMD included: see the README section")
-        print("       'GPU acceleration' to add a local whisper.cpp Vulkan server")
+        if verdict == "gpu-available":
+            print(f"[INFO] 💡 faster engine available: {reason}")
+        else:
+            print(f"[INFO] {reason} - this is the right engine for this machine")
 
     print("-" * 44)
     ok = all(results)
@@ -653,8 +795,9 @@ def _get_fallback_model():
     global _fallback_model
     with _fallback_lock:
         if _fallback_model is None:
-            print("⏳ Loading CPU fallback model (small.en)...")
-            _fallback_model = WhisperModel("small.en", device="cpu", compute_type="int8",
+            size = pick_cpu_model(os.cpu_count() or 4)
+            print(f"⏳ Loading CPU fallback model ({size})...")
+            _fallback_model = WhisperModel(size, device="cpu", compute_type="int8",
                                            cpu_threads=CONFIG["CPU_THREADS"])
         return _fallback_model
 
@@ -951,6 +1094,7 @@ def main(device_spec=None):
     if CONFIG.get("ASR_BACKEND") in ("auto", "server") and ensure_asr_server():
         print(f"⚡ ASR: GPU Vulkan server · {os.path.basename(CONFIG['ASR_SERVER_MODEL'])}")
     else:
+        _print_gpu_hint()
         model = load_model()
 
     spec = device_spec if device_spec is not None else CONFIG["DEVICE"]
@@ -1018,30 +1162,37 @@ def main(device_spec=None):
 # Live (streaming) mode - tap-to-toggle + floating overlay + as-you-go text
 # ---------------------------------------------------------------------------
 def _horn(kind, sr=44100):
-    """Synthesize a short Viking war-horn blast. A horn is a fundamental plus decaying
+    """Synthesize a short Viking war-horn call. A horn is a fundamental plus decaying
     harmonics, a slow breathy attack, and slight vibrato; start = a rising call (the
     horn summons your voice), stop = a shorter falling blast an octave-ish down. The
     two cues are deliberately UNMISTAKABLE from each other so the mic state is never
-    in doubt."""
+    in doubt.
+
+    SOFTENED 2026-07-10 (Rath: the blast was too hard): darker harmonic mix, the
+    brightness now DECAYS over the note like a real horn losing its edge, a slower
+    breathier swell instead of a punch, and a longer natural tail."""
     if kind == "start":
-        dur, f0, f1 = 0.60, 146.8, 196.0     # D3 rising to G3: the summons
+        dur, f0, f1 = 0.62, 146.8, 196.0     # D3 rising to G3: the summons
     else:
-        dur, f0, f1 = 0.38, 130.8, 98.0      # C3 falling to G2: the release
+        dur, f0, f1 = 0.42, 130.8, 98.0      # C3 falling to G2: the release
     n = int(sr * dur)
     t = np.linspace(0, dur, n, endpoint=False)
     # Pitch glides between the two notes; vibrato gives it lungs.
     glide = f0 + (f1 - f0) * (t / dur) ** 1.4
-    vib = 1.0 + 0.006 * np.sin(2 * np.pi * 5.2 * t)
+    vib = 1.0 + 0.005 * np.sin(2 * np.pi * 5.2 * t)
     phase = 2 * np.pi * np.cumsum(glide * vib) / sr
     wave = np.zeros(n, dtype=np.float64)
-    for h, g in ((1, 1.00), (2, 0.55), (3, 0.34), (4, 0.18), (5, 0.10), (6, 0.05)):
-        wave += g * np.sin(phase * h)
-    # Breathy attack and a natural tail instead of an electronic gate.
-    atk = int(sr * (0.12 if kind == "start" else 0.05))
+    # Darker mix than v1.2 (the 6-harmonic stack rasped); upper partials also fade
+    # over the note (exp decay per harmonic) so the call mellows instead of blaring.
+    for h, g in ((1, 1.00), (2, 0.42), (3, 0.16), (4, 0.06), (5, 0.02)):
+        bright = np.exp(-(h - 1) * 1.8 * t) if h > 1 else 1.0
+        wave += g * bright * np.sin(phase * h)
+    # Slow breathy swell and a long natural tail instead of an electronic gate.
+    atk = int(sr * (0.20 if kind == "start" else 0.09))
     env = np.ones(n)
-    env[:atk] = np.linspace(0, 1, atk) ** 1.6
-    rel = int(sr * 0.10)
-    env[-rel:] *= np.linspace(1, 0, rel) ** 0.8
+    env[:atk] = np.linspace(0, 1, atk) ** 2.2
+    rel = int(sr * 0.18 if kind == "start" else sr * 0.14)
+    env[-rel:] *= np.linspace(1, 0, rel) ** 1.2
     wave *= env
     wave /= max(1e-9, np.abs(wave).max())
     return wave.astype(np.float32)
@@ -1909,6 +2060,7 @@ def run_stream_mode(device_spec=None):
         print(f"⚡ ASR: GPU Vulkan server · {os.path.basename(CONFIG['ASR_SERVER_MODEL'])} "
               f"(live phrases AND the final pass)")
     else:
+        _print_gpu_hint()
         print(f"⏳ Live mode: loading CPU models (live={CONFIG['LIVE_MODEL']}, "
               f"final={CONFIG['FINAL_MODEL']}). First run downloads them once.")
         live_model = _load_whisper(CONFIG["LIVE_MODEL"])

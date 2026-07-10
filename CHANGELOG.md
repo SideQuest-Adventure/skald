@@ -1,5 +1,21 @@
 # Changelog
 
+## 1.3.0
+
+- Hardware auto-detect: Skald now reads your GPU and CPU itself, so you don't need to
+  know whether your card is NVIDIA (CUDA) or AMD (Vulkan) or what a Whisper model is.
+  `--doctor` names every GPU in plain words (discrete and Vulkan-capable vs integrated),
+  shows your CPU core count, and says which engine fits this machine. If you have a
+  capable GPU but no server set up, startup tells you the one download that unlocks
+  30-70x realtime; integrated-only boxes are told the CPU engine is the right call.
+- Model sizes default to `auto`: 8+ CPU cores get small.en, 4-7 get base.en, weaker
+  machines get tiny.en, for both classic and live mode (and the GPU-death fallback),
+  so push-to-talk stays snappy on a budget laptop out of the box. `--model` still
+  overrides everything.
+- The war horn is softened: a darker harmonic mix whose brightness decays over the
+  note like a real horn losing its edge, a slower breathier swell, a longer natural
+  tail, and a lower default volume. Rising = mic open, falling = mic closed, unchanged.
+
 ## 1.2.3
 
 - The chimes are now a synthesized Viking war horn: a rising horn call means the mic is

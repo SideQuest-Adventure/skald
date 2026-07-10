@@ -21,7 +21,7 @@ Skald is local push-to-talk speech-to-text for Windows. Tap a hotkey, talk, and 
 - Python 3.11+
 - A microphone
 
-A GPU is not required. On CPU, model size is the main speed lever; see the table below. If you do have a GPU, including an AMD one, see GPU acceleration below: Skald can ride a local whisper.cpp Vulkan server for large-model accuracy at real-time speed.
+A GPU is not required, and you don't need to know what's in your machine: Skald detects your GPU and CPU itself and picks the best engine it has for them. Run `python skald.py --doctor` and it will name your hardware in plain words and tell you if a faster engine is one download away. On CPU, the model size defaults to `auto` (picked by core count; see the table below). If you do have a GPU, NVIDIA, AMD, or Intel Arc alike, see GPU acceleration below: Skald can ride a local whisper.cpp Vulkan server for large-model accuracy at real-time speed.
 
 ## Install
 
