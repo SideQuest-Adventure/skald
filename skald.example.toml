@@ -1,0 +1,25 @@
+# Optional settings file. Copy to skald.toml and launch with --config skald.toml,
+# or use the overlay's Settings window (recommended).
+mode = "exact"
+review_before_paste = false
+save_history = true
+retention_days = 30
+auto_stop_silence = 18.0
+spoken_editing = true
+enable_app_commands = false
+hotkey = "ctrl_r"
+device = ""
+model = "auto"
+language = "en"
+chime = true
+preserve_clipboard = true
+
+[vocabulary]
+# "heard spelling" = "Preferred spelling"
+# "skull" = "Skald"
+
+[snippets]
+# "follow up" = "Thanks for your time.\nHere are the next steps."
+
+[profiles]
+# "notepad.exe" = "clean"

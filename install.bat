@@ -1,7 +1,5 @@
 @echo off
-echo Installing Skald dependencies...
-pip install faster-whisper sounddevice numpy pyperclip pynput pyautogui scipy
-echo.
-echo Done. The Whisper model (small.en, ~244 MB) downloads automatically on first run.
-echo Start with run.bat.  Check your setup any time with:  python skald.py --doctor
+echo Installing Skald into its own Python environment...
+powershell.exe -NoProfile -ExecutionPolicy Bypass -File "%~dp0tools\launch.ps1" -Install
+if errorlevel 1 exit /b 1
 pause

@@ -3,19 +3,18 @@
 DEFAULT: LIVE mode. TAP the hotkey to start, a floating overlay shows the level
 and words as you pause, tap again to stop and paste instantly.
 Classic hold-to-talk (no window) is still available:  python skald.py --classic
-Edit the CONFIG block below to change model, hotkey, and audio settings.
+Use Settings in the overlay, or skald.toml, to change your writing and controls.
 """
 
 import base64
-import collections
-import datetime
 import io
 import json
+import math
 import os
+import queue
 import re
 import sys
 import time
-import queue
 import threading
 import subprocess
 import urllib.request
@@ -28,6 +27,43 @@ import pyperclip
 import pyautogui
 from pynput import keyboard
 from faster_whisper import WhisperModel
+from pathlib import Path
+from copy import deepcopy
+from skald_writing import Settings, MODES, data_directory
+from skald_history import History
+from skald_session import WritingSession, Run
+from skald_desktop import (foreground_window, clipboard_is_plain_text,
+                           clipboard_sequence, insert_unicode)
+
+SETTINGS = Settings()
+SETTINGS_PATH = data_directory() / "skald.toml"
+HISTORY = History(data_directory() / "history.sqlite3")
+
+
+def hotkey_from_name(name):
+    name = name.strip()
+    if len(name) == 1:
+        return keyboard.KeyCode.from_char(name)
+    try:
+        return keyboard.Key[name.lower()]
+    except KeyError:
+        raise ValueError("Use a single character or a key name such as ctrl_r or f8") from None
+
+
+def apply_settings(settings):
+    global SETTINGS
+    key = hotkey_from_name(settings.hotkey)
+    settings.validate()
+    SETTINGS = settings
+    device = settings.device or None
+    if device and device.lstrip("-").isdigit():
+        device = int(device)
+    CONFIG.update(HOTKEY=key, DEVICE=device,
+                  MODEL_SIZE=settings.model, LIVE_MODEL=settings.model,
+                  LANGUAGE=settings.language.lower() or None, CHIME=settings.chime,
+                  ENABLE_COMMANDS=settings.enable_app_commands,
+                  SAVE_TRANSCRIPTS=settings.save_history,
+                  TRANSCRIPT_RETENTION_DAYS=settings.retention_days)
 
 # ---------------------------------------------------------------------------
 # CONFIG - edit these to customise behaviour
@@ -173,22 +209,18 @@ CONFIG = {
     "STREAM_SPEECH_RMS": 0.006,
     # Floating overlay look.
     "OVERLAY_OPACITY": 0.93,
-    "OVERLAY_WIDTH": 380,
-    "OVERLAY_HEIGHT": 150,
+    "OVERLAY_WIDTH": 460,
+    "OVERLAY_HEIGHT": 320,
     # Overlay waveform accent. Toggle "ice" (cool blue voice-energy, the default) or
     # "amber" (molten). Runic text, dividers, and the close control stay gold either way.
     "THEME_ACCENT": "gold",
 
-    # ---- Never-lose-a-brainstorm capture (2026-07-07, Rath's call) ----
-    # Every transcribed phrase is appended to a dated file THE MOMENT it's heard, so a
-    # misclick (paste landed in the wrong window), a crash, or an accidental close can
-    # never lose a dictation. One rolling file per day; each recording gets a timestamp
-    # header. Independent of the paste target - the file always has the words.
-    "SAVE_TRANSCRIPTS": True,               # False (or --no-save) to never write to disk
+    # Incremental SQLite recovery (v1.4); Settings controls new writes. Older daily
+    # Markdown archives stay at TRANSCRIPT_DIR and are not changed or migrated.
+    "SAVE_TRANSCRIPTS": True,
     "TRANSCRIPT_DIR": os.path.join(os.path.expanduser("~"), "Documents",
                                    "Skald Transcripts"),
-    # Housekeeping: on launch, delete transcript files older than this many days so the
-    # folder can't balloon over months of daily brainstorming. 0 = keep forever.
+    # Retention applies to unpinned recovery entries. 0 = keep forever.
     "TRANSCRIPT_RETENTION_DAYS": 30,
 
     # Audio cue on record toggle: a rising two-note when you START listening, a falling
@@ -202,7 +234,7 @@ CONFIG = {
     # ---- Command routing ----
     # When True, a transcript that STARTS WITH the prefix is parsed as a command
     # instead of being pasted. Anything else is dictated (pasted) as normal.
-    "ENABLE_COMMANDS": True,
+    "ENABLE_COMMANDS": False,
     # The wake/prefix word that turns dictation into a command. Say it first:
     # "skald open chrome", "skald search ...", "skald send ...".
     # A prefix (vs. bare verbs) prevents false triggers like "open the door".
@@ -232,6 +264,9 @@ CONFIG = {
 
 # Global state
 _recording = False
+_classic_target = None
+_classic_busy = threading.Event()
+_classic_closing = threading.Event()
 _buffer = []                       # audio chunks captured while _recording is True
 _buffer_lock = threading.Lock()
 _record_start = 0.0                # perf_counter() when the current hold began
@@ -530,6 +565,8 @@ def resolve_auto_models(hw=None):
     if "auto" in (CONFIG.get("MODEL_SIZE"), CONFIG.get("LIVE_MODEL")):
         hw = hw or detect_hardware()
         pick = pick_cpu_model(hw["cpu_cores"])
+        if CONFIG["LANGUAGE"] != "en":
+            pick = pick.removesuffix(".en")
         if CONFIG.get("MODEL_SIZE") == "auto":
             CONFIG["MODEL_SIZE"] = pick
         if CONFIG.get("LIVE_MODEL") == "auto":
@@ -550,7 +587,7 @@ def _print_gpu_hint():
 
 def cmd_doctor():
     """Self-diagnostic: print PASS/FAIL for the runtime, dependencies, a default
-    mic, the Whisper model cache dir, and a clipboard round-trip. Exits 0 only if
+    mic, the Whisper model cache dir, and non-mutating clipboard access. Exits 0 only if
     every check passes, so it works cleanly as a setup gate."""
     print("Skald self-diagnostic")
     print("-" * 44)
@@ -598,24 +635,12 @@ def cmd_doctor():
     except Exception as exc:
         check("whisper model cache dir writable", False, str(exc)[:60])
 
-    # 5. Clipboard round-trip (set then get), restoring any prior contents
+    # 5. Read without replacing rich text, images, copied files, or newer content.
     try:
         import pyperclip as _pc
-        try:
-            prev = _pc.paste()
-        except Exception:
-            prev = None
-        marker = "skald-doctor-clipboard-check"
-        _pc.copy(marker)
-        got = _pc.paste()
-        if prev is not None:
-            try:
-                _pc.copy(prev)
-            except Exception:
-                pass
-        check("clipboard round-trip (pyperclip)", got == marker)
+        check("clipboard text read (no clipboard changes)", isinstance(_pc.paste(), str))
     except Exception as exc:
-        check("clipboard round-trip (pyperclip)", False, str(exc)[:60])
+        check("clipboard text read (no clipboard changes)", False, str(exc)[:60])
 
     # 6. Hardware report: what this machine actually is, in plain words. You
     #    shouldn't need to know whether your GPU wants CUDA or Vulkan - Skald reads
@@ -784,7 +809,8 @@ def _wav_b64(audio):
 
 def transcribe_gpu(audio):
     """One clip through the Vulkan server. Raises on failure (caller decides fallback)."""
-    body = json.dumps({"audio_data": _wav_b64(audio), "langcode": "en"}).encode()
+    body = json.dumps({"audio_data": _wav_b64(audio),
+                       "langcode": CONFIG["LANGUAGE"] or ""}).encode()
     req = urllib.request.Request(CONFIG["ASR_SERVER_URL"] + "/api/extra/transcribe",
                                  data=body, headers={"Content-Type": "application/json"})
     with urllib.request.urlopen(req, timeout=120) as r:
@@ -796,6 +822,8 @@ def _get_fallback_model():
     with _fallback_lock:
         if _fallback_model is None:
             size = pick_cpu_model(os.cpu_count() or 4)
+            if CONFIG["LANGUAGE"] != "en":
+                size = size.removesuffix(".en")
             print(f"⏳ Loading CPU fallback model ({size})...")
             _fallback_model = WhisperModel(size, device="cpu", compute_type="int8",
                                            cpu_threads=CONFIG["CPU_THREADS"])
@@ -873,25 +901,52 @@ def parse_command(full_text):
     return (verb, arg)
 
 
-def _paste_text(text):
-    """Copy text to clipboard and paste into the active window."""
+def _paste_text(text, target=None, allowed=lambda: True):
+    """Deliver into the window captured at record start. Preserve the clipboard.
+
+    Rich clipboard contents use Unicode input rather than blocking dictation.
+    Restoration is conditional so a newer user clipboard change always wins.
+    """
     if not text:
-        return
+        return False
+    if not allowed():
+        return False
+    if target is not None and foreground_window() != target:
+        return False
+    preserve = SETTINGS.preserve_clipboard
+    if preserve and not clipboard_is_plain_text():
+        return insert_unicode(text, target=target, allowed=allowed)
+    previous = pyperclip.paste() if preserve else None
     pyperclip.copy(text)
-    time.sleep(0.15)  # let the original window regain focus
-    pyautogui.hotkey("ctrl", "v")
+    sequence = clipboard_sequence()
+    try:
+        time.sleep(0.15)
+        if not allowed():
+            return False
+        if target is not None and foreground_window() != target:
+            return False
+        pyautogui.hotkey("ctrl", "v")
+        time.sleep(0.6)  # allow the receiving app to consume the clipboard
+        return True
+    finally:
+        if (preserve and clipboard_sequence() == sequence
+                and pyperclip.paste() == text):
+            pyperclip.copy(previous)
 
 
-def _send_text(text):
+def _send_text(text, target=None, allowed=lambda: True):
     """Paste text then press Enter (e.g. send a Discord/chat message)."""
     text = re.sub(r"^message\s+", "", text, flags=re.IGNORECASE).strip()
     if not text:
         print("❓ Send what?")
         return
     print(f"📤 Sending: {text}")
-    _paste_text(text)
+    if not _paste_text(text, target=target, allowed=allowed):
+        print("Message held; choose its destination and copy it from Review.")
+        return
     time.sleep(0.1)
-    pyautogui.press("enter")
+    if allowed() and (target is None or foreground_window() == target):
+        pyautogui.press("enter")
 
 
 def _web_search(query):
@@ -921,12 +976,7 @@ def _open_target(arg):
         print(f"🌐 Opening {url}")
         webbrowser.open(url)
         return
-    # Last resort: let Windows try to resolve it.
-    print(f"🚀 Trying to open '{arg}' via system...")
-    try:
-        subprocess.Popen(f'start "" "{arg}"', shell=True)
-    except Exception as exc:
-        print(f"❌ Don't know how to open '{arg}'. Add it to APP_MAP. ({exc})")
+    print("Unknown app. Add a trusted entry to APP_MAP to enable it.")
 
 
 def _print_help():
@@ -939,11 +989,13 @@ def _print_help():
     print("   Anything WITHOUT the prefix is dictated (pasted) as normal.")
 
 
-def route_command(full_text):
+def route_command(full_text, target=None, allowed=lambda: True):
     """Parse and execute a command. Returns True if handled (don't paste),
     False if the transcript should fall through to normal dictation."""
     parsed = parse_command(full_text)
     if parsed is None:
+        return False
+    if not allowed() or (target is not None and foreground_window() != target):
         return False
     verb, arg = parsed
     print(f"🎯 Command: {verb}" + (f": {arg}" if arg else ""))
@@ -958,9 +1010,9 @@ def route_command(full_text):
     elif verb == "search":
         _web_search(arg)
     elif verb == "type":
-        _paste_text(arg)
+        _paste_text(arg, target=target, allowed=allowed)
     elif verb == "send":
-        _send_text(arg)
+        _send_text(arg, target=target, allowed=allowed)
     return True
 
 
@@ -977,14 +1029,24 @@ def transcribe_and_paste(model, audio):
                   f"vad_parameters.")
             return
 
-        print(f"✅ Transcribed ({elapsed:.2f}s): {full_text}")
-
-        # Command mode: if it starts with the prefix, act on it instead of pasting.
-        if CONFIG.get("ENABLE_COMMANDS") and route_command(full_text):
-            return
-
-        # Otherwise dictate: paste into the active window.
-        _paste_text(full_text)
+        print(f"Transcribed in {elapsed:.2f}s.")
+        session = LiveSession(model, model, 16000)
+        session.paste = lambda text, **kwargs: _paste_text(
+            text, target=kwargs.get("target"),
+            allowed=lambda: not _classic_closing.is_set())
+        run = Run(deepcopy(SETTINGS), _classic_target)
+        run.draft.accept(full_text)
+        run.cancelled = run.draft.cancelled
+        # Classic has no review window. Respect review-only and console shutdown.
+        if run.settings.review_before_paste or _classic_closing.is_set():
+            run.deliver = False
+        session.closing = _classic_closing.is_set()
+        session._finalize(run, [])
+        print(run.error or f"Draft {run.status}. Open Skald History to recover it.")
+        if run.output and run.status != "pasted" and not run.settings.save_history:
+            # Classic has no review UI. Keep an unsaved held draft recoverable in
+            # its console rather than overwriting a clipboard we promised to keep.
+            print("Unsaved draft held for manual copy:\n" + run.output)
 
     except Exception as exc:
         print(f"❌ Transcription error: {exc}")
@@ -992,13 +1054,17 @@ def transcribe_and_paste(model, audio):
 
 def on_press(key, model):
     """Begin buffering audio on hotkey press (stream is already running)."""
-    global _recording, _buffer, _record_start
+    global _recording, _buffer, _record_start, _classic_target
 
     if key != CONFIG["HOTKEY"] or _recording:
+        return
+    if _classic_busy.is_set() or _classic_closing.is_set():
+        print("Finishing the previous dictation; wait before recording again.")
         return
 
     with _buffer_lock:
         _buffer = []
+    _classic_target = foreground_window()
     _record_start = time.perf_counter()
     _recording = True  # set last: the callback only buffers once the list is clear
 
@@ -1024,19 +1090,23 @@ def on_release(key, model):
         return
 
     print("⏳ Transcribing...")
+    _classic_busy.set()
 
     # Run transcription in a background thread so the hotkey listener
     # stays responsive during the (potentially slow) inference.
     def _transcribe():
         global _silent_streak
-        audio, rms, secs = prepare_audio(frames_snapshot)
-        if audio is None or rms < CONFIG["SILENCE_THRESHOLD"]:
-            _silent_streak += 1
-            _report_silence(rms, secs)
-            return
-        _silent_streak = 0
-        audio = apply_auto_gain(audio, rms)
-        transcribe_and_paste(model, audio)
+        try:
+            audio, rms, secs = prepare_audio(frames_snapshot)
+            if audio is None or rms < CONFIG["SILENCE_THRESHOLD"]:
+                _silent_streak += 1
+                _report_silence(rms, secs)
+                return
+            _silent_streak = 0
+            audio = apply_auto_gain(audio, rms)
+            transcribe_and_paste(model, audio)
+        finally:
+            _classic_busy.clear()
 
     threading.Thread(target=_transcribe, daemon=True).start()
 
@@ -1094,6 +1164,8 @@ def main(device_spec=None):
     if CONFIG.get("ASR_BACKEND") in ("auto", "server") and ensure_asr_server():
         print(f"⚡ ASR: GPU Vulkan server · {os.path.basename(CONFIG['ASR_SERVER_MODEL'])}")
     else:
+        if CONFIG.get("ASR_BACKEND") == "server":
+            sys.exit("The GPU server is unavailable. Start it or choose backend auto.")
         _print_gpu_hint()
         model = load_model()
 
@@ -1150,11 +1222,20 @@ def main(device_spec=None):
     except KeyboardInterrupt:
         print("\n👋 Skald stopped.")
     finally:
+        _classic_closing.set()
+        if _recording:
+            on_release(CONFIG["HOTKEY"], model)
         try:
             _stream.stop()
             _stream.close()
         except Exception:
             pass
+        if _classic_busy.is_set():
+            print("Saving the pending dictation before closing...")
+            # Event.wait() on the busy flag returns immediately while set, so poll
+            # the flag here. The console stays alive until recovery is written.
+            while _classic_busy.is_set():
+                time.sleep(0.1)
     sys.exit(0)
 
 
@@ -1226,223 +1307,16 @@ def _load_whisper(size):
 # (Phrase dividers were removed by owner feedback: the transcript flows as one passage.)
 
 
-class LiveSession:
-    """Owns --stream state across four threads, talking only via queues:
-      • PortAudio callback (audio_cb) - push chunks while recording + the live level
-      • pynput listener   (on_press)  - tap toggles recording on/off
-      • worker thread     (_run_worker) - segment on pauses, transcribe, finalize+paste
-      • main thread       (the _Overlay tkinter loop) - drains ui_q, draws the meter
-    Each recording gets a FRESH chunk queue and the worker keeps its OWN audio +
-    transcript locals, so a quick stop-then-start can't cross-contaminate runs.
-    """
-
-    WAVE_BARS = 64        # rolling RMS samples backing the live waveform meter
-
-    def __init__(self, live_model, final_model, capture_sr):
-        self.live_model = live_model
-        self.final_model = final_model
-        self.capture_sr = capture_sr
-        self.recording = False
-        self.key_armed = False
-        self.level = 0.0
-        # Rolling window of recent RMS values that drives the live waveform meter. The
-        # PortAudio thread only APPENDS here (cheap, lock-free); the tkinter thread reads
-        # a snapshot at ~30fps to draw. Nothing on the ASR/paste hot path touches it.
-        self.rms_history = collections.deque([0.0] * self.WAVE_BARS,
-                                             maxlen=self.WAVE_BARS)
-        self.active_q = None             # audio_cb enqueues here ONLY while non-None
-        self.chunk_q = None              # current run's queue (for the stop sentinel)
-        self.ui_q = queue.Queue()
-        self.worker = None
-        self.record_start = 0.0          # perf_counter() at tap-on (drives the timer)
-        self.capture_path = None         # lazily-opened dated transcript file
-        self.capture_lock = threading.Lock()
-        # Serializes ALL model.transcribe() + paste calls. A fast stop-then-start can
-        # leave the old worker still finalizing while a new one streams; without this
-        # they'd call transcribe() on the same CTranslate2 model concurrently (can
-        # segfault) and interleave clipboard writes. The lock makes both safe.
-        self.engine_lock = threading.Lock()
-
-    # ---- PortAudio thread ----
-    def audio_cb(self, indata, frames, time_info, status):
-        mono = indata.astype(np.float32).flatten()
-        self.level = float(np.sqrt(np.mean(mono ** 2))) if mono.size else 0.0
-        # Feed the waveform: split this block into a few sub-windows and append each
-        # one's RMS, so the meter dances at a livelier rate than the 10Hz block cadence.
-        # Pure append onto a deque; the drawing all happens later on the tkinter thread.
-        if mono.size:
-            parts = np.array_split(mono, 4)
-            for p in parts:
-                if p.size:
-                    self.rms_history.append(float(np.sqrt(np.mean(p ** 2))))
-        q = self.active_q                # single atomic read snapshots the run's queue,
-        if q is not None:                # so even if _start swaps in a new queue mid-call
-            q.put(indata.copy())         # a stale tail chunk can't leak into the new run
-
-    # ---- pynput thread ----
-    def on_press(self, key):
-        if key != CONFIG["HOTKEY"] or self.key_armed:
-            return
-        self.key_armed = True            # one tap = one toggle; ignore OS auto-repeat
-        self.toggle()
-
-    def on_release(self, key):
-        if key == CONFIG["HOTKEY"]:
-            self.key_armed = False
-
-    def toggle(self):
-        self._stop() if self.recording else self._start()
-
-    def _start(self):
-        q = queue.Queue()                # fresh queue isolates this run
-        self.chunk_q = q
-        self.record_start = time.perf_counter()
-        self._capture(header=True)       # stamp a timestamp header for this recording
-        self.worker = threading.Thread(target=self._run_worker, args=(q,), daemon=True)
-        self.ui_q.put(("reset", None))
-        self.ui_q.put(("status", ("listening", "● Listening")))
-        self.worker.start()
-        self.recording = True
-        self.active_q = q                # set LAST: audio_cb enqueues only once ready
-        _chime("start")                  # rising cue: now listening
-
-    def _stop(self):
-        self.active_q = None             # FIRST: audio_cb stops enqueuing immediately
-        self.recording = False
-        self.ui_q.put(("status", ("finalizing", "⏳ Finalizing")))
-        if self.chunk_q is not None:
-            self.chunk_q.put(None)       # sentinel unblocks the worker -> finalize
-        _chime("stop")                   # falling cue: stopped listening
-
-    def _capture(self, text="", header=False):
-        """Append a phrase (or a per-recording timestamp header) to today's transcript
-        file the moment it's heard. This is the never-lose-a-brainstorm guarantee: the
-        words hit disk independent of where the paste lands, so a misclick / crash /
-        accidental close can't lose them. Fully isolated - any failure is swallowed so
-        capture can never break dictation."""
-        if not CONFIG.get("SAVE_TRANSCRIPTS"):
-            return
-        if not header and not (text or "").strip():
-            return
-        try:
-            with self.capture_lock:
-                if self.capture_path is None:
-                    d = CONFIG["TRANSCRIPT_DIR"]
-                    os.makedirs(d, exist_ok=True)
-                    self._prune_old(d)   # housekeeping, once per session
-                    self.capture_path = os.path.join(
-                        d, f"skald-{datetime.datetime.now():%Y-%m-%d}.md")
-                with open(self.capture_path, "a", encoding="utf-8") as f:
-                    if header:
-                        f.write(f"\n\n## {datetime.datetime.now():%H:%M:%S}\n\n")
-                    else:
-                        f.write(text.strip() + "\n")
-        except Exception:
-            pass                         # capture must never break dictation
-
-    def _prune_old(self, d):
-        """Delete skald-*.md older than TRANSCRIPT_RETENTION_DAYS so months of daily
-        brainstorming can't pile up unbounded. 0 = keep forever. Fully guarded."""
-        days = CONFIG.get("TRANSCRIPT_RETENTION_DAYS", 0)
-        if not days or days <= 0:
-            return
-        cutoff = time.time() - days * 86400
-        try:
-            for name in os.listdir(d):
-                if name.startswith("skald-") and name.endswith(".md"):
-                    p = os.path.join(d, name)
-                    try:
-                        if os.path.getmtime(p) < cutoff:
-                            os.remove(p)
-                    except Exception:
-                        pass
-        except Exception:
-            pass
-
-    # ---- worker thread (self-contained per run) ----
-    def _run_worker(self, q):
-        speech_rms = CONFIG["STREAM_SPEECH_RMS"]
-        need_sil = CONFIG["PHRASE_SILENCE_MS"]
-        min_sp = CONFIG["PHRASE_MIN_MS"]
-        max_s = CONFIG["PHRASE_MAX_SECONDS"]
-        max_full = int(CONFIG["MAX_RECORD_SECONDS"] * self.capture_sr)
-        transcript, full, full_n = [], [], 0
-        phrase, sil_ms, sp_ms = [], 0.0, 0.0
-        while True:
-            try:
-                chunk = q.get(timeout=0.25)
-            except queue.Empty:
-                continue
-            if chunk is None:
-                break                    # stop sentinel
-            if full_n < max_full:        # cap session audio so a long hold can't grow
-                full.append(chunk)       # memory without bound (the final pass trims to
-                full_n += len(chunk)     # the same first-N samples anyway)
-            phrase.append(chunk)
-            dur_ms = len(chunk) / self.capture_sr * 1000.0
-            rms = float(np.sqrt(np.mean(chunk.astype(np.float32) ** 2)))
-            if rms >= speech_rms:
-                sp_ms += dur_ms
-                sil_ms = 0.0
-            else:
-                sil_ms += dur_ms
-            phrase_s = sum(len(c) for c in phrase) / self.capture_sr
-            # Flush on a real pause (needs some speech first), OR force-flush a long
-            # phrase regardless of level - so a quiet/gated monologue still streams and
-            # `phrase` can never grow unbounded waiting for speech that reads as silence.
-            if (sp_ms >= min_sp and sil_ms >= need_sil) or phrase_s >= max_s:
-                self._emit_phrase(phrase, transcript)
-                phrase, sil_ms, sp_ms = [], 0.0, 0.0
-        if phrase and sp_ms >= min_sp:   # trailing speech captured before the stop
-            self._emit_phrase(phrase, transcript)
-        self._finalize(full, transcript)
-
-    def _transcribe(self, model, audio):
-        if audio.size == 0:
-            return ""
-        with self.engine_lock:           # serializes model calls AND keeps pastes ordered
-            return transcribe_any(model, audio)
-
-    def _emit_phrase(self, phrase_chunks, transcript):
-        audio = np.concatenate(phrase_chunks, axis=0).flatten().astype(np.float32)
-        audio = apply_auto_gain(resample_to_16k(audio, self.capture_sr))
-        text = self._transcribe(self.live_model, audio)
-        if text:
-            transcript.append(text)
-            self._capture(text)          # persist THIS phrase now (crash/misclick-proof)
-            # Display flows phrases together as one passage, exactly like the paste.
-            display = " ".join(transcript)
-            self.ui_q.put(("partial", display))
-
-    def _finalize(self, full_chunks, transcript):
-        final_text = " ".join(transcript).strip()
-        # With the GPU server active, the full-clip accuracy pass costs ~0.5s even on a
-        # 20s clip - so ALWAYS run it there (big-model quality, still feels instant).
-        # On CPU it only runs if FINAL_MODEL is set (None = paste the live text as-is).
-        if (CONFIG["FINAL_MODEL"] or gpu_asr_active()) and full_chunks:
-            audio = np.concatenate(full_chunks, axis=0).flatten().astype(np.float32)
-            audio = resample_to_16k(audio, self.capture_sr)
-            maxs = int(CONFIG["MAX_RECORD_SECONDS"] * 16000)
-            if audio.size > maxs:
-                audio = audio[:maxs]
-            # Gain off the VOICED part only - averaging RMS over the inter-phrase
-            # silence would dilute it and over-boost vs. the per-phrase live passes.
-            voiced = audio[np.abs(audio) > 0.005]
-            rms = (float(np.sqrt(np.mean(voiced ** 2))) if voiced.size
-                   else float(np.sqrt(np.mean(audio ** 2))) if audio.size else 0.0)
-            audio = apply_auto_gain(audio, rms)
-            refined = self._transcribe(self.final_model, audio)
-            if refined:
-                final_text = refined
-        if final_text:
-            self.ui_q.put(("final", final_text))
-            with self.engine_lock:       # atomic copy+paste - no interleave with a
-                if not (CONFIG.get("ENABLE_COMMANDS") and route_command(final_text)):
-                    _paste_text(final_text)   # concurrent run's paste
-            self.ui_q.put(("status", ("idle", "✓ Pasted, tap to talk")))
-        else:
-            self.ui_q.put(("final", ""))
-            self.ui_q.put(("status", ("idle", "nothing heard, tap to talk")))
+class LiveSession(WritingSession):
+    def __init__(self, live_model, final_model, capture_sr, settings=None, history=None):
+        super().__init__(live_model, final_model, capture_sr,
+                         settings=settings or SETTINGS, config=CONFIG,
+                         history=history or HISTORY,
+                         transcribe=lambda model, audio: transcribe_any(model, audio),
+                         resample=resample_to_16k, gain=apply_auto_gain,
+                         refine_available=lambda: gpu_asr_active(),
+                         paste=lambda text, **kwargs: _paste_text(text, **kwargs),
+                         chime=_chime, route_command=route_command)
 
 
 class _Overlay:
@@ -1467,7 +1341,7 @@ class _Overlay:
             "amber": ("#6B4E1F", "#B07E2E", "#F5C879")}
     SB_TRACK, SB_THUMB, SB_W = "#2E2A22", "#E8C766", 14   # scrollbar: track, gold thumb, width
 
-    MIN_W, MIN_H = 280, 140
+    MIN_W, MIN_H = 440, 300
 
     def __init__(self, root, sess, subtitle):
         import tkinter as tk
@@ -1538,15 +1412,53 @@ class _Overlay:
         self.copy_lbl.pack(side="right", padx=(0, 12))
         self.copy_lbl.bind("<Button-1>", self._copy)
 
+        self._dialogs = set()
+
+        def button(parent, title, action):
+            seal = {"Record": "ᚱ", "Pause": "ᛁ", "Cancel": "ᛉ", "Review": "ᛗ",
+                    "History": "ᛟ", "Settings": "ᚷ"}.get(title, "ᛊ")
+            edge = tk.Frame(parent, bg=self.BORDER, padx=1, pady=1)
+            edge.pack(side="left", fill="x", expand=True, padx=(0, 5))
+            control = tk.Button(edge, text=f"{seal}  {title.upper()}", command=action,
+                                takefocus=False, cursor="hand2", bg="#2D2B28",
+                                fg=self.GOLD, activebackground="#51432A",
+                                activeforeground=self.GOLD_HI, relief="flat", bd=0,
+                                highlightthickness=0, padx=7, pady=6,
+                                font=("Palatino Linotype", 9, "bold"))
+            control.pack(fill="x")
+            control.bind("<Enter>", lambda e: (edge.configure(bg=self.GOLD_HI),
+                                               control.configure(bg="#3C3427", fg=self.GOLD_HI)))
+            control.bind("<Leave>", lambda e: (edge.configure(bg=self.BORDER),
+                                               control.configure(bg="#2D2B28", fg=self.GOLD)))
+            return control
+
+        actions = tk.Frame(frame, bg=self.BG)
+        actions.pack(fill="x", padx=12, pady=(4, 6))
+        self.record_btn = button(actions, "Record", self.sess.toggle)
+        self.pause_btn = button(actions, "Pause", self.sess.pause)
+        button(actions, "Cancel", self.sess.cancel)
+        button(actions, "Review", self._review)
+
+        options = tk.Frame(frame, bg=self.BG)
+        options.pack(fill="x", padx=12, pady=(0, 6))
+        self.mode_btn = button(options, self.sess.settings.mode.title(), self._cycle_mode)
+        button(options, "History", self._history)
+        button(options, "Settings", self._settings)
+        self.saving_lbl = tk.Label(options, bg=self.BG, fg=self.SUB,
+                                   font=("Segoe UI", 9))
+        self.saving_lbl.pack(side="right")
+        self._refresh_controls()
+
         # ---- status row (listening state + live timer) ----
         status_row = tk.Frame(frame, bg=self.BG)
         status_row.pack(fill="x", padx=12, pady=(0, 2))
         self.status = tk.Label(status_row, text="Tap to talk", bg=self.BG, fg=self.ACC,
-                               font=("Segoe UI", 10, "bold"))
+                               font=("Segoe UI", 10, "bold"), anchor="w",
+                               justify="left", wraplength=410, height=2)
         self.status.pack(side="left")
 
         # ---- live waveform meter (the centerpiece) ----
-        self.canvas = tk.Canvas(frame, height=40, bg=self.BG, highlightthickness=0)
+        self.canvas = tk.Canvas(frame, height=64, bg=self.BG, highlightthickness=0)
         self.canvas.pack(fill="x", padx=12, pady=2)
 
         # Running transcript: a scrollable, read-only Text that shows the WHOLE
@@ -1605,6 +1517,98 @@ class _Overlay:
         root.after(80, self._no_activate)
         root.after(50, self._tick)
         root.after(33, self._wave_loop)      # ~30fps waveform, independent of _tick
+
+    def _refresh_controls(self):
+        self.mode_btn.configure(text=f"ᛊ  {self.sess.settings.mode.upper()}")
+        self.saving_lbl.configure(text="Saving on" if self.sess.settings.save_history else "Saving off")
+
+    def _track_dialog(self, win):
+        self._dialogs.add(win)
+        self.sess.dialog_open = True
+
+        def closed(event):
+            if event.widget is win:
+                self._dialogs.discard(win)
+                self.sess.dialog_open = bool(self._dialogs)
+        win.bind("<Destroy>", closed, add="+")
+        return win
+
+    def _save_settings(self, updated):
+        hotkey_from_name(updated.hotkey)
+        updated.save(SETTINGS_PATH)
+        apply_settings(updated)
+        self.sess.settings = updated
+        self._refresh_controls()
+        self.sess.status("Settings saved; restart for microphone, model, or language changes")
+
+    def _cycle_mode(self):
+        if self.sess.busy:
+            self.sess.status("Finish this dictation before changing modes", "listening")
+            return
+        from dataclasses import replace
+        mode = MODES[(MODES.index(self.sess.settings.mode) + 1) % len(MODES)]
+        try:
+            self._save_settings(replace(self.sess.settings, mode=mode))
+        except (ValueError, OSError) as exc:
+            self.sess.status(f"Could not save settings: {exc}", "error")
+
+    def _settings(self):
+        if self.sess.busy:
+            self.sess.status("Finish this dictation before opening Settings", "listening")
+            return
+        from skald_ui import show_settings
+        try:
+            devices = sorted({device["name"] for device in sd.query_devices()
+                              if device["max_input_channels"] > 0})
+        except Exception:
+            devices = ()
+        self.sess.dialog_open = True
+        try:
+            self._track_dialog(show_settings(self.root, self.sess.settings,
+                                            self._save_settings, devices))
+        finally:
+            self.sess.dialog_open = bool(self._dialogs)
+
+    def _review(self, run=None):
+        if self.sess.busy and run is None:
+            self.sess.status("Finish this dictation before reviewing", "listening")
+            return
+        run = run or self.sess.last_run
+        if run is None or not run.draft.original:
+            self.sess.status("No draft yet; record something first")
+            return
+        from skald_ui import show_review
+
+        def save(text):
+            run.output = text
+            self.last_text = text
+            if not self.sess._save(run, "reviewed"):
+                raise OSError("History unavailable; the draft is still in memory")
+        self._track_dialog(show_review(self.root, "\n".join(run.draft.original),
+                                       run.output, run.settings.mode, pyperclip.copy, save,
+                                       learn=self._learn_spelling))
+
+    def _learn_spelling(self, heard, preferred):
+        from dataclasses import replace
+        vocabulary = {k: v for k, v in self.sess.settings.vocabulary.items()
+                      if k.casefold() != heard.casefold()}
+        vocabulary[heard] = preferred
+        self._save_settings(replace(self.sess.settings, vocabulary=vocabulary))
+
+    def _history(self):
+        if self.sess.busy:
+            self.sess.status("Finish this dictation before opening History", "listening")
+            return
+        from skald_ui import show_history, show_review
+
+        def review(row):
+            def save(text):
+                HISTORY.save(row["id"], row["created_at"], row["original"], text,
+                             row["mode"], "reviewed")
+            self._track_dialog(show_review(self.root, row["original"], row["output"],
+                                           row["mode"], pyperclip.copy, save,
+                                           learn=self._learn_spelling))
+        self._track_dialog(show_history(self.root, HISTORY, review))
 
     def _apply_exstyle(self, noactivate, toolwindow):
         """Set/clear WS_EX_NOACTIVATE + WS_EX_TOOLWINDOW on the CURRENT native window
@@ -1701,6 +1705,7 @@ class _Overlay:
         # a taller window means a thicker, more detailed current.
         try:
             wave_h = max(40, min(160, int(self.root.winfo_height() * 0.22)))
+            self.status.configure(wraplength=max(200, self.root.winfo_width() - 24))
             if wave_h != getattr(self, "_wave_h", 40):
                 self._wave_h = wave_h
                 self.canvas.configure(height=wave_h)
@@ -1776,15 +1781,16 @@ class _Overlay:
     # ---- geometry persistence (position + size survive restarts) ----
     @staticmethod
     def _state_path():
-        import os
-        return os.path.join(os.path.dirname(os.path.abspath(__file__)),
-                            "overlay_state.json")
+        return str(SETTINGS_PATH.parent / "overlay_state.json")
 
     @staticmethod
     def _load_state():
         import json
         try:
-            with open(_Overlay._state_path(), encoding="utf-8") as f:
+            path = _Overlay._state_path()
+            if not os.path.exists(path):
+                path = os.path.join(os.path.dirname(__file__), "overlay_state.json")
+            with open(path, encoding="utf-8") as f:
                 st = json.load(f)
             return {k: int(st[k]) for k in ("w", "h", "x", "y")}
         except Exception:
@@ -1798,6 +1804,7 @@ class _Overlay:
             st = {"w": self.root.winfo_width(), "h": self.root.winfo_height(),
                   "x": self.root.winfo_x(), "y": self.root.winfo_y()}
             if st["w"] >= self.MIN_W and st["h"] >= self.MIN_H:
+                os.makedirs(os.path.dirname(self._state_path()), exist_ok=True)
                 with open(self._state_path(), "w", encoding="utf-8") as f:
                     json.dump(st, f)
         except Exception:
@@ -1838,16 +1845,17 @@ class _Overlay:
 
     def _quit(self):
         self._save_state()               # remember size/position for next launch
-        self._alive = False              # stop ticks from touching torn-down widgets
         if self.on_quit:
             self.on_quit()
         else:
+            self._alive = False
             try:
                 self.root.destroy()
             except Exception:
                 pass
 
     def _tick(self):
+        import tkinter as tk
         if not self._alive:
             return                       # quit in progress - don't re-arm or touch UI
         try:
@@ -1866,18 +1874,22 @@ class _Overlay:
                         if t:
                             self.last_text = t          # remember full text for ⎘ copy
                         self._set_text(t)               # full transcript, scrollable
+                    elif kind == "review" and not self.sess.closing:
+                        self._review(payload)
             except queue.Empty:
                 pass
             # While recording, show a live elapsed timer in the status line (highlight as
             # it nears the MAX_RECORD_SECONDS trim cap). Runs after the queue drain so it
             # wins over the static "Listening" message set at tap-on.
-            if self.sess.recording and self.sess.record_start:
+            self.record_btn.configure(text="ᛏ  FINISH" if self.sess.recording else "ᚱ  RECORD")
+            self.pause_btn.configure(text="ᚹ  RESUME" if self.sess.paused else "ᛁ  PAUSE")
+            if self.sess.recording and not self.sess.paused and self.sess.record_start:
                 el = int(time.perf_counter() - self.sess.record_start)
                 m, s = divmod(el, 60)
                 near_cap = el >= CONFIG["MAX_RECORD_SECONDS"] - 30
                 self.status.config(text=f"● Listening  {m}:{s:02d}",
                                    fg=self.WARN if near_cap else self.ACC)
-        except Exception:
+        except tk.TclError:
             return                       # widgets torn down mid-tick, stop quietly
         self.root.after(50, self._tick)
 
@@ -1901,6 +1913,13 @@ class _Overlay:
         """Load the pre-rendered sprite-wave frame bank (assets/wave). Returns None
         when the bank is missing so the overlay falls back to the bar meter."""
         import tkinter as tk
+        from skald_wave import RibbonFrames
+        hd = Path(__file__).resolve().parent / "assets" / "wave-hd"
+        if (hd / "manifest.json").exists():
+            try:
+                return {"hd": RibbonFrames(hd)}
+            except (OSError, ValueError, KeyError) as exc:
+                print(f"Blue ribbon artwork unavailable; using original sprites: {exc}")
         base = os.path.join(os.path.dirname(os.path.abspath(__file__)), "assets", "wave")
         try:
             star = [tk.PhotoImage(file=os.path.join(base, f"star_{i}.png"))
@@ -1917,16 +1936,15 @@ class _Overlay:
     RUNES = "ᚠᚢᚦᚨᚱᚲᚷᚹᚾᛁᛃᛈᛊᛏᛒᛖᛗᛚᛜᛞᛟ"
 
     def _draw_wave_sprite(self):
-        """Rath's soundwave art, alive: the starburst breathes at the left, the stream
-        scrolls RIGHTWARD and swells with the voice (5 amplitude levels x 8 phases from
-        the shipped frame bank), and gold runes spawn off the star and drift down the
-        current when you speak. All work stays on the tk thread; the audio callback
-        only feeds the RMS deque."""
-        import random
+        """Blue knotwork ribbons glide right; a separate gold string follows speech.
+
+        Pre-sized antialiased artwork keeps the filaments sharp without runtime
+        imaging dependencies. All drawing stays on the Tk thread.
+        """
         c = self.canvas
         vals = list(self.sess.rms_history)
-        raw = min(max((max(vals[-6:]) if vals else 0.0) / 0.08, 0.0), 1.0)
-        if not self.sess.recording:
+        raw = min(max((max(vals[-6:]) if vals else 0.0) / 0.025, 0.0), 1.0)
+        if not self.sess.recording or self.sess.paused:
             raw = 0.0
         # Smooth so the wave swells and settles instead of twitching.
         self._level = 0.82 * getattr(self, "_level", 0.0) + 0.18 * raw
@@ -1936,6 +1954,18 @@ class _Overlay:
         mid = ch // 2
         sp = self._sprites
         c.delete("all")
+        now = time.perf_counter()
+        dt = min(0.05, max(0.0, now - getattr(self, "_rune_clock", now - 0.033)))
+        self._rune_clock = now
+        if "hd" in sp:
+            source_x = sp["hd"].draw(c, w, ch, lv, dt, self.BG)
+        else:
+            source_x = self._draw_legacy_blue_stream(w, ch, mid, lv)
+        self._draw_rune_stream(w, mid, source_x, dt)
+
+    def _draw_legacy_blue_stream(self, w, ch, mid, lv):
+        """Keep the original bank as a fallback when HD artwork is absent."""
+        c, sp = self.canvas, self._sprites
         # Vertical stretch: taller canvas -> integer vertical zoom of the frames, so
         # the ribbons genuinely thicken as the window grows. Zoomed frames are cached.
         sy = max(1, round(ch / 40))
@@ -1967,30 +1997,35 @@ class _Overlay:
                 star = star.zoom(sy, sy)
             zc[skey] = star
         c.create_image(0, mid, anchor="w", image=star)
-        # Rune drift: new glyphs leave the star while you speak and ride the current.
+        return float(sp["star_w"] * sy + 4)
+
+    def _draw_rune_stream(self, w, mid, source_x, dt):
+        import random
+        c = self.canvas
+        # One evenly spaced string, emitted directly from microphone activity.
+        # Advance every glyph at the same speed; louder syllables must not pile
+        # multiple runes onto the source or make older glyphs bunch together.
         runes = getattr(self, "_runes", None)
         if runes is None:
             runes = self._runes = []
-        # Louder voice = more runes, bigger runes. Full voice can gust two per tick.
-        cap = 6 + int(lv * 14)
-        spawns = (1 if random.random() < 0.06 + 0.55 * lv else 0) + \
-                 (1 if lv > 0.7 and random.random() < 0.35 else 0)
-        if self.sess.recording:
-            spread = max(mid - 6, 1)
-            for _ in range(spawns):
-                if len(runes) >= cap:
-                    break
-                runes.append({"x": float(sp["star_w"] * sy + 4),
-                              "y": mid + random.randint(-spread, spread),
-                              "g": random.choice(self.RUNES), "age": 0,
-                              "size": 10 + int(lv * 5)})
+        spacing = 28.0
+        for r in runes:
+            r["x"] += 125.0 * dt
+        speaking = (self.sess.recording and not self.sess.paused
+                    and self.sess.level >= CONFIG["STREAM_SPEECH_RMS"])
+        if speaking and (not runes or runes[-1]["x"] - source_x >= spacing):
+            runes.append({"x": source_x, "g": random.choice(self.RUNES),
+                          "age": 0.0, "size": 17})
         keep = []
         for r in runes:
-            r["x"] += 1.6 + 3.4 * lv
-            r["age"] += 1
-            if r["x"] < w and r["age"] < 90:
-                col = self.GOLD_HI if r["age"] < 24 else (
-                      self.GOLD if r["age"] < 60 else "#8A6A1F")
+            r["age"] += dt
+            r["y"] = mid + 3 * math.sin((r["x"] - source_x) / 55.0)
+            if r["x"] < w:
+                edge = min(1.0, max(0.0, (w - r["x"]) / 70.0))
+                col = self.GOLD_HI if edge > 0.6 else (self.GOLD if edge > 0.25 else "#9A7D33")
+                c.create_text(r["x"] + 1, r["y"] + 1, text=r["g"], fill="#5E481F",
+                              font=("Palatino Linotype", r.get("size", 12) + 2, "bold"),
+                              anchor="w")
                 c.create_text(r["x"], r["y"], text=r["g"], fill=col,
                               font=("Palatino Linotype", r.get("size", 10), "bold"),
                               anchor="w")
@@ -2060,6 +2095,8 @@ def run_stream_mode(device_spec=None):
         print(f"⚡ ASR: GPU Vulkan server · {os.path.basename(CONFIG['ASR_SERVER_MODEL'])} "
               f"(live phrases AND the final pass)")
     else:
+        if CONFIG.get("ASR_BACKEND") == "server":
+            sys.exit("The GPU server is unavailable. Start it or choose backend auto.")
         _print_gpu_hint()
         print(f"⏳ Live mode: loading CPU models (live={CONFIG['LIVE_MODEL']}, "
               f"final={CONFIG['FINAL_MODEL']}). First run downloads them once.")
@@ -2100,7 +2137,10 @@ def run_stream_mode(device_spec=None):
     print("━" * 50 + "\n")
 
     def on_quit():
-        overlay._alive = False           # stop ticks touching dead widgets
+        if sess.closing:
+            return
+        overlay._save_state()
+        sess.shutdown()                  # flush pending speech; never paste on close
         try:
             listener.stop()
         except Exception:
@@ -2110,12 +2150,17 @@ def run_stream_mode(device_spec=None):
             stream.close()
         except Exception:
             pass
-        try:
+        def finish_close():
+            if sess.busy:
+                sess.status("Saving pending speech before closing", "finalizing")
+                root.after(100, finish_close)
+                return
+            overlay._alive = False
             root.destroy()
-        except Exception:
-            pass
+        finish_close()
 
     overlay.on_quit = on_quit
+    root.protocol("WM_DELETE_WINDOW", on_quit)
     # A no-op periodic callback keeps the interpreter ticking so Ctrl+C in the
     # console can still interrupt tkinter's mainloop on Windows.
     def _heartbeat():
@@ -2128,8 +2173,62 @@ def run_stream_mode(device_spec=None):
         root.mainloop()
     except KeyboardInterrupt:
         on_quit()
+        if overlay._alive:
+            root.mainloop()             # allow the pending save/close callback to run
     print("\n👋 Live Mode stopped.")
     sys.exit(0)
+
+
+def run_demo():
+    """Visual QA with synthetic text, isolated settings, no mic and no model."""
+    import tempfile
+    import tkinter as tk
+    from dataclasses import replace
+    global SETTINGS_PATH, HISTORY
+    qa = Path(__file__).resolve().parent / "qa"
+    qa.mkdir(exist_ok=True)
+    with tempfile.TemporaryDirectory(prefix="demo-", dir=qa) as directory:
+        SETTINGS_PATH = Path(directory) / "skald.toml"
+        settings = Settings(vocabulary={"skull": "Skald"},
+                            snippets={"follow up": "Thanks for your time.\nHere are the next steps."})
+        settings.save(SETTINGS_PATH)
+        apply_settings(settings)
+        HISTORY = History(Path(directory) / "history.sqlite3")
+        sess = LiveSession(None, None, 16000)
+        sess.chime = lambda kind: None
+        sess.transcribe = lambda model, audio: "Example dictation."
+        sess.refine_available = lambda: False
+        sess.paste = lambda text, **kwargs: False
+        for mode, text in (("exact", "A thought worth keeping. Your original words stay available."),
+                           ("clean", "Um, confirm the delivery date is Thursday, not Tuesday."),
+                           ("bullets", "Review the draft.\nShare the next steps.\nKeep the original.")):
+            run = Run(replace(settings, mode=mode), None)
+            run.draft.accept(text)
+            run.output = run.draft.output
+            sess._save(run, "ready")
+            sess.last_run = run
+        root = tk.Tk()
+        overlay = _Overlay(root, sess, "Speak freely. Shape your draft. Keep your words.")
+        # Use a normal taskbar window for the demo so desktop capture tools can
+        # inspect it. The real dictation overlay keeps its no-activation behavior.
+        def show_demo_window():
+            root.overrideredirect(False)
+            overlay._apply_exstyle(noactivate=False, toolwindow=False)
+            root.deiconify()
+        root.after(150, show_demo_window)
+        sess.ui_q.put(("final", "Confirm the delivery date is Thursday, not Tuesday.\n\nYour draft is ready for review."))
+        sess.status("Demo: no microphone, model download, or automatic paste")
+
+        def close():
+            sess.shutdown()
+            if sess.busy:
+                root.after(50, close)
+                return
+            overlay._alive = False
+            root.destroy()
+        overlay.on_quit = close
+        root.protocol("WM_DELETE_WINDOW", close)
+        root.mainloop()
 
 
 if __name__ == "__main__":
@@ -2153,6 +2252,10 @@ if __name__ == "__main__":
 
     ap = argparse.ArgumentParser(
         description="Skald - push-to-talk speech-to-text with auto-paste.")
+    ap.add_argument("--config", help="path to your skald.toml settings file")
+    ap.add_argument("--mode", choices=MODES, help="writing mode for this run")
+    ap.add_argument("--review", action="store_true", help="review each draft before pasting")
+    ap.add_argument("--demo", action="store_true", help="preview with example text; no mic or model")
     ap.add_argument("--list", action="store_true",
                     help="list input devices (with host API + gate warnings) and exit")
     ap.add_argument("--doctor", action="store_true",
@@ -2167,7 +2270,8 @@ if __name__ == "__main__":
                     help="Whisper model override, e.g. base.en (fastest sane) / small.en "
                          "(default) / medium.en (accurate but 0.6x realtime on this CPU)")
     ap.add_argument("--max-seconds", type=int, dest="max_seconds",
-                    help="max recording length before a clip is trimmed (default 600)")
+                    help="classic clip/live accuracy-pass audio limit (default 600); "
+                         "live streaming continues beyond it")
     ap.add_argument("--stream", action="store_true",
                     help="(now the DEFAULT) LIVE mode: tap to start/stop, floating overlay")
     ap.add_argument("--classic", action="store_true",
@@ -2180,9 +2284,44 @@ if __name__ == "__main__":
     ap.add_argument("--no-chime", action="store_true", dest="no_chime",
                     help="silence the record-toggle chime for this run")
     ap.add_argument("--no-save", action="store_true", dest="no_save",
-                    help="don't save transcripts to disk this run (default: save to "
-                         "~/Documents/Skald Transcripts so a brainstorm is never lost)")
+                    help="don't save dictation history to disk this run")
     args = ap.parse_args()
+
+    if args.demo:
+        run_demo()
+        sys.exit(0)
+    if args.max_seconds is not None and args.max_seconds <= 0:
+        ap.error("--max-seconds must be positive")
+    if args.threshold is not None and (not math.isfinite(args.threshold)
+                                       or not 0 < args.threshold <= 1):
+        ap.error("--threshold must be greater than 0 and at most 1")
+    try:
+        if args.config:
+            SETTINGS_PATH = Path(args.config).expanduser().resolve()
+        settings = Settings.load(SETTINGS_PATH)
+        hotkey_from_name(settings.hotkey)
+        if not SETTINGS_PATH.exists():
+            settings.save(SETTINGS_PATH)
+        if args.mode:
+            settings.mode = args.mode
+        if args.review:
+            settings.review_before_paste = True
+        if args.no_save:
+            settings.save_history = False
+        if args.no_chime:
+            settings.chime = False
+        if args.chime and not args.no_chime:
+            settings.chime = True
+        if args.model:
+            settings.model = args.model
+        if args.device:
+            settings.device = args.device
+        apply_settings(settings)
+        HISTORY = History(SETTINGS_PATH.parent / "history.sqlite3")
+        if settings.save_history:
+            HISTORY.prune(settings.retention_days)
+    except (ValueError, TypeError, OSError) as exc:
+        ap.error(f"Settings: {exc}")
 
     if args.backend:
         CONFIG["ASR_BACKEND"] = args.backend
@@ -2195,8 +2334,10 @@ if __name__ == "__main__":
 
     if args.threshold is not None:
         CONFIG["SILENCE_THRESHOLD"] = args.threshold
+        CONFIG["STREAM_SPEECH_RMS"] = args.threshold
     if args.model:
         CONFIG["MODEL_SIZE"] = args.model
+        CONFIG["LIVE_MODEL"] = args.model
     if args.max_seconds is not None:
         CONFIG["MAX_RECORD_SECONDS"] = args.max_seconds
 

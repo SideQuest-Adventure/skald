@@ -1,5 +1,34 @@
 # Changelog
 
+## 1.4.0 (2026-11-13)
+
+- Personal vocabulary with literal whole-term corrections and a Remember spelling
+  control in Review. Original model output is preserved separately.
+- Exact, Clean, and Bullets modes. Clean removes explicit English hesitation sounds;
+  Bullets follows spoken line breaks. Neither mode summarizes or rewrites meaning.
+- Prefixed spoken editing: line/paragraph breaks, punctuation, undo, replace, cancel,
+  and named text shortcuts. Edits apply to the current draft before delivery.
+- Brain-dump review with an editable draft, original speech, Save draft, and explicit
+  Copy. Searchable local history, pinning, deletion, and recovery after interruptions.
+- Validated, atomically saved TOML settings, microphone/hotkey selection, optional
+  per-app writing modes, and pause/resume/finish/cancel overlay controls.
+- An 18-second configurable prolonged-silence stop; zero disables it.
+- Paste guards for window changes, conditional plain-text clipboard restoration,
+  and cancellation checks immediately before injection. Rich clipboards remain
+  intact while Unicode text is delivered directly to the destination.
+- Long recordings retain all streamed text; final ASR cannot resurrect spoken edits
+  or replace a long recording with its truncated first segment. Final output is
+  journaled before delivery; shutdown flushes pending speech without initiating paste.
+- App launch/search/send commands are disabled by default. Arbitrary spoken app names
+  are no longer interpolated into shell commands.
+- Windows launcher discovers Python and prefers a project virtual environment;
+  install.bat now installs the same requirements as the manual path.
+- Sharper blue knotwork ribbons with continuous rightward movement, a glowing
+  circular source, and a steady string of voice-driven gold runes. Antialiased
+  artwork is prepared at six sizes without adding runtime imaging dependencies.
+- Gold rune controls with hover states. Fixed a frozen overlay caused by a missing
+  queue import, restoring live status and transcript updates.
+
 ## 1.3.0
 
 - Hardware auto-detect: Skald now reads your GPU and CPU itself, so you don't need to

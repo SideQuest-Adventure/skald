@@ -1,0 +1,14 @@
+{
+  "heights": [
+    48,
+    64,
+    80,
+    96,
+    128,
+    160
+  ],
+  "levels": 7,
+  "width": 640,
+  "source": "../wave-hd-source.png",
+  "style": "approved-blue-knotwork"
+}

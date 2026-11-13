@@ -8,3 +8,9 @@ assets/Skald-source.png
 assets/Skald-Pixel-source.png
 engines/
 assets/Soundwave.png
+qa/
+skald.toml
+*.sqlite3
+*.sqlite3-journal
+*.sqlite3-wal
+*.sqlite3-shm

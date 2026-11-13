@@ -15,7 +15,7 @@ format). This file adds only repo facts + the hard limits.
 - This repo is PUBLIC: extra care that no private-hub paths/data leak into commits.
 
 ## This repo
-- **What**: Skald (public, SideQuest-Adventure org) — dictation tool, v1.3.0.
+- **What**: Skald (public, SideQuest-Adventure org) — Windows dictation tool, v1.4.0.
 - **Lane**: Python.
 - **Tests**: `python -m pytest tests/` if deps present; otherwise state tests were not run.
 - **Resume doc**: `HANDOFF.md` + `LEDGER.md` if present.
